@@ -57,6 +57,13 @@ from ..events import (
     ThinkingDelta,
 )
 from ..http import make_client, raise_for_status
+from ..streaming.text_tool_parser import (
+    TextChunk,
+    ToolCallInputDelta as _ParserToolDelta,
+    ToolCallStart as _ParserToolStart,
+    ToolCallStop as _ParserToolStop,
+    ToolCallTextParser,
+)
 from ..types import (
     AssistantMessage,
     Message,
@@ -223,19 +230,43 @@ class OllamaProvider(HTTPProviderMixin):
                 payload["options"].update(opts)
             payload.update(extra)
 
-        async for ev in self._stream_ndjson(payload, model=model):
+        # When we're on the prompt-engineered path, the model emits
+        # ``<tool_call>...</tool_call>`` blocks in its text content. We thread
+        # a parser through the stream so they become real ToolUseBlock events
+        # the agent loop can dispatch. Without this, the model's tool-call
+        # syntax would be passed straight through as text — the model would
+        # then fabricate its own ``<tool_result>`` in the same response and
+        # the SDK would never call a real tool.
+        text_parser = None if use_native_tools else ToolCallTextParser()
+
+        async for ev in self._stream_ndjson(payload, model=model, text_parser=text_parser):
             yield ev
 
     async def _stream_ndjson(
-        self, payload: dict[str, Any], *, model: str
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str,
+        text_parser: ToolCallTextParser | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        """Drive the Ollama /api/chat NDJSON stream.
+
+        ``text_parser`` is set when we're on the prompt-engineered Path B/C
+        and need to extract ``<tool_call>`` blocks from text content. When
+        ``None``, content streams as plain text deltas (Path A native path).
+        """
+
         message_id = f"ollama-{uuid4().hex[:12]}"
         started = False
-        # We use a single virtual text content block (index 0). Each tool call
-        # gets its own block at a monotonically increasing index.
-        text_open = False
-        next_index = 0
-        text_index: int | None = None
+        # Mutable index cursor — shared with the parser-routing helper.
+        cursor: dict[str, Any] = {
+            "next_index": 0,
+            "text_index": None,
+            "text_open": False,
+            # Map parser call_id → block index, so InputDelta and Stop emit
+            # against the same content block.
+            "tool_indices": {},
+        }
 
         async with self.client.stream(
             "POST", "/api/chat", content=_JSON_ENCODER.encode(payload)
@@ -266,42 +297,45 @@ class OllamaProvider(HTTPProviderMixin):
                 msg = chunk.get("message") or {}
                 content = msg.get("content") or ""
 
-                # Text delta — open text block lazily on first non-empty token.
                 if content:
-                    if not text_open:
-                        text_index = next_index
-                        next_index += 1
-                        yield ContentBlockStart(
-                            index=text_index,
-                            block=TextBlock(text=""),
+                    if text_parser is not None:
+                        # Prompt-engineered path: route every text chunk
+                        # through the parser; it emits TextChunk / ToolCall*
+                        # events that we translate to normalized StreamEvents.
+                        for parser_ev in text_parser.feed(content):
+                            for out in _from_parser_event(parser_ev, cursor):
+                                yield out
+                    else:
+                        # Native path: pass content straight through.
+                        if not cursor["text_open"]:
+                            cursor["text_index"] = cursor["next_index"]
+                            cursor["next_index"] += 1
+                            yield ContentBlockStart(
+                                index=cursor["text_index"],
+                                block=TextBlock(text=""),
+                            )
+                            cursor["text_open"] = True
+                        yield ContentBlockDelta(
+                            index=cursor["text_index"],
+                            delta=TextDelta(text=content),
                         )
-                        text_open = True
-                    assert text_index is not None
-                    yield ContentBlockDelta(
-                        index=text_index,
-                        delta=TextDelta(text=content),
-                    )
 
                 # Thinking — some Ollama builds expose a ``thinking`` field on
                 # the message for R1-class models served in reasoning mode.
                 thinking = msg.get("thinking")
                 if thinking:
-                    # Use a dedicated index for thinking; we don't track it as
-                    # an "open" block because Ollama doesn't span it across
-                    # chunks — each thinking field is self-contained.
                     yield ContentBlockDelta(
-                        index=text_index if text_open else 0,
+                        index=cursor["text_index"] if cursor["text_open"] else 0,
                         delta=ThinkingDelta(thinking=thinking),
                     )
 
-                # Tool calls — Ollama emits them as a complete list in one
-                # chunk (usually the final one). Synthesize Start + Delta + Stop.
+                # Native tool calls — Ollama emits them as a complete list in
+                # one chunk (usually the final one).
                 tool_calls = msg.get("tool_calls") or []
                 for tc in tool_calls:
                     fn = (tc or {}).get("function") or {}
                     name = fn.get("name")
                     args = fn.get("arguments") or {}
-                    # Ollama gives dict args; OpenAI gives string. Tolerate both.
                     if isinstance(args, str):
                         try:
                             args_dict = _JSON_DECODER.decode(args)
@@ -316,8 +350,8 @@ class OllamaProvider(HTTPProviderMixin):
                     if not isinstance(name, str) or not name:
                         continue
                     tool_id = tc.get("id") or f"call_{uuid4().hex[:12]}"
-                    tool_index = next_index
-                    next_index += 1
+                    tool_index = cursor["next_index"]
+                    cursor["next_index"] += 1
                     yield ContentBlockStart(
                         index=tool_index,
                         block=ToolUseBlock(id=tool_id, name=name, input=args_dict),
@@ -332,13 +366,23 @@ class OllamaProvider(HTTPProviderMixin):
 
                 # Final chunk.
                 if chunk.get("done"):
-                    if text_open and text_index is not None:
-                        yield ContentBlockStop(index=text_index)
-                        text_open = False
+                    # Flush parser if present (handles unterminated text + tag).
+                    parser_emitted_tools = False
+                    if text_parser is not None:
+                        for parser_ev in text_parser.finalize():
+                            if isinstance(parser_ev, (_ParserToolStart, _ParserToolStop)):
+                                parser_emitted_tools = True
+                            for out in _from_parser_event(parser_ev, cursor):
+                                yield out
+                    if cursor["text_open"] and cursor["text_index"] is not None:
+                        yield ContentBlockStop(index=cursor["text_index"])
+                        cursor["text_open"] = False
                     usage = _decode_usage(chunk)
                     stop_reason = _map_stop_reason(
                         chunk.get("done_reason"),
-                        has_tool_calls=bool(tool_calls),
+                        has_tool_calls=bool(tool_calls)
+                        or bool(cursor["tool_indices"])
+                        or parser_emitted_tools,
                     )
                     yield MessageDelta(stop_reason=stop_reason, usage=usage)
                     yield MessageStop()
@@ -347,8 +391,12 @@ class OllamaProvider(HTTPProviderMixin):
             # Stream ended without a final ``done:true`` chunk.
             if not started:
                 raise ProviderError("Ollama stream ended with no chunks")
-            if text_open and text_index is not None:
-                yield ContentBlockStop(index=text_index)
+            if text_parser is not None:
+                for parser_ev in text_parser.finalize():
+                    for out in _from_parser_event(parser_ev, cursor):
+                        yield out
+            if cursor["text_open"] and cursor["text_index"] is not None:
+                yield ContentBlockStop(index=cursor["text_index"])
             yield MessageDelta(stop_reason="end_turn", usage=None)
             yield MessageStop()
 
@@ -372,6 +420,73 @@ def _render_block_as_text(blk: Any) -> str:
     if hasattr(blk, "source"):  # ImageBlock
         return "[image]"
     return ""
+
+
+def _from_parser_event(ev: Any, cursor: dict[str, Any]) -> list[StreamEvent]:
+    """Translate a ToolCallTextParser event to normalized StreamEvents.
+
+    ``cursor`` is the mutable state from _stream_ndjson (``next_index``,
+    ``text_index``, ``text_open``, ``tool_indices``). We append to it as
+    we open/close text and tool-use blocks. Returning a list (not yielding)
+    keeps the caller a generator without surprises.
+    """
+
+    out: list[StreamEvent] = []
+    if isinstance(ev, TextChunk):
+        if not cursor["text_open"]:
+            cursor["text_index"] = cursor["next_index"]
+            cursor["next_index"] += 1
+            out.append(
+                ContentBlockStart(
+                    index=cursor["text_index"], block=TextBlock(text="")
+                )
+            )
+            cursor["text_open"] = True
+        out.append(
+            ContentBlockDelta(
+                index=cursor["text_index"], delta=TextDelta(text=ev.text)
+            )
+        )
+        return out
+
+    if isinstance(ev, _ParserToolStart):
+        # Close any open text block before opening a tool_use block — the
+        # agent loop expects strict index ordering.
+        if cursor["text_open"] and cursor["text_index"] is not None:
+            out.append(ContentBlockStop(index=cursor["text_index"]))
+            cursor["text_open"] = False
+            cursor["text_index"] = None
+
+        tool_index = cursor["next_index"]
+        cursor["next_index"] += 1
+        cursor["tool_indices"][ev.call_id] = tool_index
+        out.append(
+            ContentBlockStart(
+                index=tool_index,
+                block=ToolUseBlock(id=ev.call_id, name=ev.name, input={}),
+            )
+        )
+        return out
+
+    if isinstance(ev, _ParserToolDelta):
+        idx = cursor["tool_indices"].get(ev.call_id)
+        if idx is None:
+            return out  # orphan delta — drop silently
+        out.append(
+            ContentBlockDelta(
+                index=idx, delta=InputJsonDelta(partial_json=ev.partial_json)
+            )
+        )
+        return out
+
+    if isinstance(ev, _ParserToolStop):
+        idx = cursor["tool_indices"].pop(ev.call_id, None)
+        if idx is None:
+            return out
+        out.append(ContentBlockStop(index=idx))
+        return out
+
+    return out
 
 
 def _decode_usage(chunk: dict[str, Any]) -> Usage | None:
