@@ -66,7 +66,7 @@ from .permissions import (
 )
 from .providers.base import Provider, detect_provider, resolve
 from .streaming.executor import StreamingToolExecutor
-from .tools import Tool, ToolRegistry, dispatch_tool_calls
+from .tools import ToolRegistry
 from .types import (
     AssistantMessage,
     ContentBlock,
@@ -330,11 +330,14 @@ class Agent:
           * The synthetic user-context ``UserMessage`` (``isMeta=True``) if
             one is injected at the head of the conversation.
           * One :class:`AssistantMessage` per turn, the moment that turn's
-            stream finishes assembling. The :class:`StreamingToolExecutor`
-            has already started dispatching its tool calls in parallel by
-            the time the yield happens (tool dispatch begins as soon as a
-            tool_use block's input JSON closes mid-stream — *not* after the
-            assistant message finalizes).
+            stream finishes assembling. By the time the yield happens, the
+            :class:`StreamingToolExecutor` has *already* been dispatching its
+            tool calls — each tool's body was kicked off the instant its
+            ``tool_use`` block's input JSON closed mid-stream, NOT after
+            ``MessageStop``. Long-running tools may already be finished, or
+            may still be in flight when the yield happens; the next yield
+            (the tool-result ``UserMessage``) blocks until every dispatched
+            tool has produced a result block.
           * One :class:`UserMessage` carrying the batch of
             :class:`ToolResultBlock` s for each turn that requested tools.
           * Nothing after the final natural-stop turn — callers use the
@@ -348,6 +351,28 @@ class Agent:
         permission checks (including ``PermissionResultAllow.updated_input``
         rewrites), ``BudgetExceededError`` on turn / usd / token overruns,
         and ``Stop`` hook fired on natural turn-end.
+
+        Mid-stream dispatch contract
+        ----------------------------
+        For each ``ContentBlockStop`` event that closes a ``tool_use``
+        block, the agent immediately:
+
+          1. Materializes the ``ToolUseBlock`` (parses the closed input
+             JSON; malformed JSON defers to ``finalize()`` which raises
+             ``StreamProtocolError`` — same as the buffered path).
+          2. Runs the ``PreToolUse`` hook with a snapshot of the
+             conversation *before* this assistant turn (the partial
+             assistant message in progress is not yet appended).
+          3. Runs the permission check; ``Allow.updated_input`` rewrites
+             the call, ``Deny`` short-circuits to an ``is_error`` result
+             block (and is recorded for ``ResultMessage.permission_denials``).
+          4. Hands the surviving call to the live ``StreamingToolExecutor``
+             via ``add_tool_call`` — the body starts running concurrently
+             with the remainder of the stream.
+
+        Tool result blocks are returned in the same order as the model
+        emitted the tool_use blocks — ``StreamingToolExecutor`` preserves
+        insertion order regardless of which tool finished first.
         """
 
         assert self._dispatcher is not None  # set in __post_init__
@@ -368,168 +393,260 @@ class Agent:
                 if messages and isinstance(messages[0], UserMessage) and getattr(messages[0], "isMeta", False):
                     yield messages[0]
 
+        registry: ToolRegistry = self.tools  # type: ignore[assignment]
+
         for _ in range(self.max_steps):
-            assistant = await self._one_turn(messages)
-            messages.append(assistant)
+            # --------------------------------------------------------------
+            # One turn, with mid-stream tool dispatch.
+            #
+            # The executor stays open across the *entire* provider stream
+            # so it can accept ``add_tool_call`` invocations the moment a
+            # tool_use block's input JSON finalizes. Tool bodies start
+            # running concurrently with subsequent text/tool deltas — the
+            # cost saved is the per-turn ``max(tool_dur) - 0`` rather than
+            # ``sum(tool_dur)`` we paid pre-streaming.
+            # --------------------------------------------------------------
+            assembler = _AssistantAssembler()
+            # Block indices we've already dispatched (so a duplicate
+            # ContentBlockStop on the same index doesn't re-fire).
+            dispatched_indices: set[int] = set()
+            # Calls in the order the model emitted them (matches the order
+            # of ToolUseBlocks in the finalized assistant.content).
+            ordered_calls: list[ToolUseBlock] = []
+            # Calls that were short-circuited by hooks or permissions.
+            # Their entries in ``ordered_calls`` are the ORIGINAL blocks;
+            # the result lives in ``short_circuit`` keyed by call id.
+            short_circuit: dict[str, ToolResultBlock] = {}
+            # Snapshot of the conversation BEFORE this assistant turn —
+            # passed to hooks so they see the same context the model saw.
+            messages_snapshot = list(messages)
 
-            # Bump turn + cost AFTER the assistant message materializes,
-            # so we don't strand a budget overrun mid-stream.
-            if self._budget_tracker is not None:
-                self._budget_tracker.add_turn()
-                if assistant.usage is not None:
-                    self._budget_tracker.add_usage(
-                        assistant.usage, self.model, backend_hint=self._provider_hint
+            async with StreamingToolExecutor(registry) as executor:
+                async for ev in self._provider_stream(messages):
+                    assembler.feed(ev)
+                    if isinstance(ev, ContentBlockStop):
+                        await self._maybe_dispatch_closed_block(
+                            ev,
+                            assembler,
+                            dispatched_indices,
+                            ordered_calls,
+                            short_circuit,
+                            messages_snapshot,
+                            executor,
+                        )
+
+                # Stream consumed. Finalize the assistant message.
+                assistant = assembler.finalize()
+                messages.append(assistant)
+
+                # Bump turn + cost AFTER the assistant message materializes.
+                # Tools may already be running — that's fine, we still
+                # enforce budget on the turn that just finalized.
+                if self._budget_tracker is not None:
+                    self._budget_tracker.add_turn()
+                    if assistant.usage is not None:
+                        self._budget_tracker.add_usage(
+                            assistant.usage,
+                            self.model,
+                            backend_hint=self._provider_hint,
+                        )
+                    self._budget_tracker.check()
+
+                # Yield the assistant turn the moment it's complete — BEFORE
+                # blocking on tool execution. Consumers see the tool_use
+                # blocks immediately and can render "tool running…" state
+                # while ``wait_all`` drains the executor.
+                yield assistant
+
+                tool_uses = [
+                    b for b in assistant.content if isinstance(b, ToolUseBlock)
+                ]
+                if not tool_uses:
+                    # Natural turn-end. Fire Stop hook and exit cleanly —
+                    # the executor's ``__aexit__`` releases its task group
+                    # (no tasks were ever started because no tool_use blocks
+                    # arrived).
+                    await self._dispatcher.dispatch(
+                        "Stop",
+                        HookContext(event="Stop", messages_snapshot=messages),
                     )
-                # Enforce — raises BudgetExceededError if any limit is over.
-                self._budget_tracker.check()
+                    return
 
-            # Yield the assistant turn the moment it's complete — before
-            # we synchronously block on tool execution. Consumers see the
-            # tool_use blocks immediately and can render "tool running…"
-            # state while ``_run_tool_batch`` does its parallel dispatch.
-            yield assistant
+                # Drain every dispatched tool. ``wait_all`` returns results
+                # in insertion order (= stream order = assistant.content
+                # tool_use order). Tools that errored produce
+                # ``is_error=True`` blocks; tools that haven't been
+                # dispatched (short-circuited) aren't represented here.
+                executor_results = await executor.wait_all()
 
-            tool_calls = [b for b in assistant.content if isinstance(b, ToolUseBlock)]
-            if not tool_calls:
-                # Fire the Stop hook on natural turn-end (no tool follow-up).
-                await self._dispatcher.dispatch(
-                    "Stop",
-                    HookContext(event="Stop", messages_snapshot=messages),
+            # PostToolUse hooks for each tool that actually executed.
+            by_id: dict[str, ToolResultBlock] = {
+                r.tool_use_id: r for r in executor_results
+            }
+            by_id.update(short_circuit)
+
+            for call in ordered_calls:
+                if call.id in short_circuit:
+                    continue
+                tool = registry.get(call.name)
+                if tool is None:
+                    continue
+                result = by_id.get(call.id)
+                if result is None:
+                    continue
+                event_name = (
+                    "PostToolUseFailure" if result.is_error else "PostToolUse"
                 )
-                return
+                await self._dispatcher.dispatch(
+                    event_name,
+                    HookContext(
+                        event=event_name,
+                        tool=tool,
+                        input=call.input,
+                        output=result.content,
+                    ),
+                )
 
-            # Run the tool batch through the streaming executor + safety net.
-            results = await self._run_tool_batch(tool_calls, messages)
-            tool_result_msg = UserMessage(content=list(results))
+            # Align results with assistant.content tool_use blocks in order.
+            results_in_order = [by_id[b.id] for b in tool_uses]
+            tool_result_msg = UserMessage(content=list(results_in_order))
             messages.append(tool_result_msg)
             yield tool_result_msg
 
         _log.warning("agent hit max_steps=%d without natural stop", self.max_steps)
 
-    async def _run_tool_batch(
+    async def _maybe_dispatch_closed_block(
         self,
-        calls: list[ToolUseBlock],
-        messages: list[Message],
-    ) -> list[ToolResultBlock]:
-        """Dispatch a single batch of tool calls under hooks + permissions."""
+        ev: ContentBlockStop,
+        assembler: "_AssistantAssembler",
+        dispatched_indices: set[int],
+        ordered_calls: list[ToolUseBlock],
+        short_circuit: dict[str, ToolResultBlock],
+        messages_snapshot: list[Message],
+        executor: StreamingToolExecutor,
+    ) -> None:
+        """If the block at ``ev.index`` is a freshly-closed tool_use,
+        preflight it (PreToolUse hook + permission) and either dispatch it
+        to the live ``StreamingToolExecutor`` or record a short-circuit
+        result.
+
+        Idempotent: ``dispatched_indices`` guards against duplicate
+        ``ContentBlockStop`` events on the same index. Malformed input JSON
+        is *skipped* here and re-raised at ``assembler.finalize()`` so the
+        whole turn errors out — matching the pre-streaming behavior.
+        """
+
+        idx = ev.index
+        if idx in dispatched_indices:
+            return
+        builder = assembler.blocks.get(idx)
+        if builder is None or builder.kind != "tool_use":
+            return
+        dispatched_indices.add(idx)
+
+        try:
+            block = builder.to_block()
+        except StreamProtocolError:
+            # Malformed input JSON. Let ``finalize()`` re-raise the
+            # canonical error — don't dispatch a broken call.
+            return
+        assert isinstance(block, ToolUseBlock)
+
+        approved_call, sc_result = await self._preflight_call(
+            block, messages_snapshot
+        )
+        if sc_result is not None:
+            short_circuit[block.id] = sc_result
+            ordered_calls.append(block)
+            return
+
+        ordered_calls.append(approved_call)
+        executor.add_tool_call(approved_call)
+
+    async def _preflight_call(
+        self,
+        call: ToolUseBlock,
+        messages_snapshot: list[Message],
+    ) -> tuple[ToolUseBlock, ToolResultBlock | None]:
+        """PreToolUse hook + permission check for one call.
+
+        Returns ``(call_to_dispatch, short_circuit_result)``. The
+        second element is ``None`` when the call survives; otherwise the
+        caller records the error result and skips dispatch. The returned
+        call may have a different ``input`` than the original if a hook
+        or ``PermissionResultAllow.updated_input`` rewrote it.
+
+        Unknown tools (not in the registry) skip the hook/permission
+        chain entirely and dispatch as-is — the executor produces the
+        canonical "tool not found" error block.
+        """
 
         assert self._dispatcher is not None
         registry: ToolRegistry = self.tools  # type: ignore[assignment]
+        tool = registry.get(call.name)
+        if tool is None:
+            return call, None
 
-        # Pre-flight every call: PreToolUse hook + permission check.
-        # Each call is either approved (and possibly input-mutated) or
-        # short-circuited to an is_error result block.
-        approved: list[ToolUseBlock] = []
-        short_circuit: dict[str, ToolResultBlock] = {}
-
-        for call in calls:
-            tool = registry.get(call.name)
-            if tool is None:
-                # Unknown tool. Let the executor surface this — it has the
-                # canonical "not found" path. Skip pre-checks.
-                approved.append(call)
-                continue
-
-            # PreToolUse hook
-            ctx = HookContext(
+        # PreToolUse hook.
+        hr = await self._dispatcher.dispatch(
+            "PreToolUse",
+            HookContext(
                 event="PreToolUse",
                 tool=tool,
                 input=call.input,
-                messages_snapshot=messages,
+                messages_snapshot=messages_snapshot,
+            ),
+        )
+        if hr.block:
+            return call, ToolResultBlock(
+                tool_use_id=call.id,
+                content=f"blocked by hook: {hr.note or 'no reason given'}",
+                is_error=True,
             )
-            hr = await self._dispatcher.dispatch("PreToolUse", ctx)
-            if hr.block:
-                short_circuit[call.id] = ToolResultBlock(
+
+        # Apply hook-mutated input. ToolUseBlock is frozen — rebuild it.
+        payload = hr.mutated_input if hr.mutated_input is not None else call.input
+        if payload is not call.input:
+            call = ToolUseBlock(id=call.id, name=call.name, input=payload)
+
+        # Permission check.
+        if self.permissions is not None:
+            decision = await check_permission(tool, call.input, self.permissions)
+            decision = _normalize_permission_decision(decision)
+
+            if isinstance(decision, Deny):
+                await self._dispatcher.dispatch(
+                    "PermissionDenied",
+                    HookContext(
+                        event="PermissionDenied",
+                        tool=tool,
+                        input=call.input,
+                        arbitrary={"reason": decision.reason},
+                    ),
+                )
+                self._permission_denials.append(
+                    {
+                        "tool_name": call.name,
+                        "tool_use_id": call.id,
+                        "tool_input": dict(call.input or {}),
+                    }
+                )
+                return call, ToolResultBlock(
                     tool_use_id=call.id,
-                    content=f"blocked by hook: {hr.note or 'no reason given'}",
+                    content=f"permission denied: {decision.reason}",
                     is_error=True,
                 )
-                continue
 
-            # Apply hook-mutated input if any.
-            payload = hr.mutated_input if hr.mutated_input is not None else call.input
-            if payload is not call.input:
-                # ToolUseBlock is frozen — rebuild with new input.
-                call = ToolUseBlock(id=call.id, name=call.name, input=payload)
+            if isinstance(decision, Allow) and decision.updated_input is not None:
+                call = ToolUseBlock(
+                    id=call.id,
+                    name=call.name,
+                    input=decision.updated_input,
+                )
+            # Ask → treated as Allow at the loop layer (integrators can
+            # convert Ask to Deny via the can_use_tool callback).
 
-            # Permission check.
-            if self.permissions is not None:
-                decision = await check_permission(tool, call.input, self.permissions)
-                # Bridge Claude-shape PermissionResultAllow/Deny returned
-                # from a user-supplied can_use_tool callback to our internal
-                # Allow/Deny structs. Duck-type on .behavior since the Claude
-                # variants are plain dataclasses, not msgspec Structs.
-                decision = _normalize_permission_decision(decision)
-
-                if isinstance(decision, Deny):
-                    await self._dispatcher.dispatch(
-                        "PermissionDenied",
-                        HookContext(
-                            event="PermissionDenied",
-                            tool=tool,
-                            input=call.input,
-                            arbitrary={"reason": decision.reason},
-                        ),
-                    )
-                    # Record for the SDKResultMessage.permission_denials
-                    # surface. Shape matches Claude SDK's SDKPermissionDenial
-                    # so query() can pass straight through without
-                    # transforming.
-                    self._permission_denials.append(
-                        {
-                            "tool_name": call.name,
-                            "tool_use_id": call.id,
-                            "tool_input": dict(call.input or {}),
-                        }
-                    )
-                    short_circuit[call.id] = ToolResultBlock(
-                        tool_use_id=call.id,
-                        content=f"permission denied: {decision.reason}",
-                        is_error=True,
-                    )
-                    continue
-
-                # Allow.updated_input rewrites the tool args before dispatch
-                # — matches Claude SDK PermissionResultAllow semantics. The
-                # ToolUseBlock is frozen, so rebuild with the patched input.
-                if isinstance(decision, Allow) and decision.updated_input is not None:
-                    call = ToolUseBlock(
-                        id=call.id,
-                        name=call.name,
-                        input=decision.updated_input,
-                    )
-                # Ask → in v0 we treat Ask as Allow at the loop layer.
-                # Integrators can convert Ask to Deny via the can_use_tool callback.
-
-            approved.append(call)
-
-        # Dispatch approved calls under the StreamingToolExecutor.
-        async with StreamingToolExecutor(registry) as executor:
-            for call in approved:
-                executor.add_tool_call(call)
-            executor_results = await executor.wait_all()
-
-        # PostToolUse hooks for each executed call.
-        for call, result in zip(approved, executor_results):
-            tool = registry.get(call.name)
-            if tool is None:
-                continue
-            event_name = "PostToolUseFailure" if result.is_error else "PostToolUse"
-            await self._dispatcher.dispatch(
-                event_name,
-                HookContext(
-                    event=event_name,
-                    tool=tool,
-                    input=call.input,
-                    output=result.content,
-                ),
-            )
-
-        # Merge short-circuited results with executor results, preserving
-        # original call order.
-        by_id: dict[str, ToolResultBlock] = {r.tool_use_id: r for r in executor_results}
-        by_id.update(short_circuit)
-        return [by_id[c.id] for c in calls]
+        return call, None
 
     async def stream(self, messages: list[Message]) -> AsyncIterator[StreamEvent]:
         """Stream the next assistant turn as normalized events.
@@ -564,14 +681,6 @@ class Agent:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
-
-    async def _one_turn(self, messages: list[Message]) -> AssistantMessage:
-        """Consume the stream and assemble one assistant message."""
-
-        assembler = _AssistantAssembler()
-        async for ev in self._provider_stream(messages):
-            assembler.feed(ev)
-        return assembler.finalize()
 
     def _provider_stream(self, messages: list[Message]) -> AsyncIterator[StreamEvent]:
         # Hoist the system prompt: prefer explicit Agent.system, else look at

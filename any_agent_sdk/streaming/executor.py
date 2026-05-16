@@ -114,6 +114,19 @@ def _stringify(out: Any) -> str:
         return str(out)
 
 
+def _flatten_exception_group(eg: BaseExceptionGroup) -> list[BaseException]:
+    """Walk a (possibly nested) ``BaseExceptionGroup`` and return the leaf
+    exceptions. anyio 4.x can nest groups arbitrarily — a single-leaf
+    group nested two deep should still unwrap cleanly."""
+    out: list[BaseException] = []
+    for sub in eg.exceptions:
+        if isinstance(sub, BaseExceptionGroup):
+            out.extend(_flatten_exception_group(sub))
+        else:
+            out.append(sub)
+    return out
+
+
 class StreamingToolExecutor:
     """Dispatch tool calls as they arrive on the stream.
 
@@ -192,8 +205,25 @@ class StreamingToolExecutor:
         self._closed = True
         # Closing the task group joins all in-flight tasks.
         assert self._tg is not None
+        unwrap_exc: BaseException | None = None
         try:
             await self._tg.__aexit__(exc_type, exc, tb)
+        except BaseExceptionGroup as eg:
+            # anyio 4.x ALWAYS wraps body-raised exceptions in a
+            # ``BaseExceptionGroup`` at task-group exit, even when no child
+            # task raised. That makes plain exception flow (e.g. a
+            # ``BudgetExceededError`` raised in the body of
+            # ``async with StreamingToolExecutor(...)``) bubble up as a
+            # group to our caller — which is brittle and not what callers
+            # expect from a "dispatch tools and run them" helper. Unwrap
+            # singleton groups so callers see the original exception.
+            flat = _flatten_exception_group(eg)
+            if len(flat) == 1:
+                unwrap_exc = flat[0]
+            else:
+                # Multiple distinct exceptions — keep the group so the
+                # caller can inspect every failure.
+                raise
         finally:
             # Fill any leftover None slots — shouldn't happen if the TG joined
             # cleanly, but a stray cancellation could leave a hole.
@@ -209,6 +239,8 @@ class StreamingToolExecutor:
             self._pending = 0
             if not self._idle_event.is_set():
                 self._idle_event.set()
+        if unwrap_exc is not None:
+            raise unwrap_exc
 
     # ------------------------------------------------------------------
     # Public API

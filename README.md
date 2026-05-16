@@ -244,7 +244,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] Capability-table-driven path selection (30+ models)
 - [x] Parallel tool dispatch
 - [x] Tool result threading
-- [ ] Streaming tool dispatch (start tool execution mid-stream, not after `MessageStop`)
+- [x] Streaming tool dispatch (start tool execution mid-stream, not after `MessageStop`)
 
 **Thinking / reasoning**
 - [x] Inline `<think>` blocks (DeepSeek-R1, QwQ, Marco-o1, R1-distill family)
