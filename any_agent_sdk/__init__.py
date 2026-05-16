@@ -48,6 +48,7 @@ from .claude_compat import (
     PermissionResult as ClaudePermissionResult,
     PermissionResultAllow,
     PermissionResultDeny,
+    Plugin,
     ResultMessage,
     ToolPermissionContext,
     create_sdk_mcp_server,

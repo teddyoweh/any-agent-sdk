@@ -82,6 +82,7 @@ __all__ = [
     "PermissionResult",
     "PermissionResultAllow",
     "PermissionResultDeny",
+    "Plugin",
     "ResultMessage",
     "SystemMessage",
     "TextBlock",
@@ -201,12 +202,42 @@ class ClaudeAgentOptions:
         # We stash them on extra so the SystemMessage(subtype="init")
         # can still emit them as configured, and skip the agent's
         # actual tool registry (which only wants Tool instances).
+        real_tools_acc: list[Tool] = []
+        builtin_names_acc: list[str] = []
         if self.tools is not None:
             real_tools, builtin_names = _split_tools(self.tools)
-            if real_tools:
-                opts["tools"] = real_tools
-            if builtin_names:
-                opts.setdefault("extra", {})["builtin_tool_names"] = builtin_names
+            real_tools_acc.extend(real_tools)
+            builtin_names_acc.extend(builtin_names)
+
+        # Plugins — bundles of (tools, system_prompt_addition, hooks).
+        # Merge into the same buckets so the agent sees one combined view.
+        # System-prompt additions are collected here and joined into
+        # opts["system"] at the end (after the user's system_prompt is set
+        # by the caller above). This matches Claude SDK semantics: plugin
+        # text appends to whatever the user passed.
+        plugin_system_additions: list[str] = []
+        plugin_hooks_dicts: list[dict[str, list[Any]]] = []
+        if self.plugins:
+            for p in self.plugins:
+                if getattr(p, "tools", None):
+                    real_tools_acc.extend(p.tools)
+                addition = getattr(p, "system_prompt_addition", None)
+                if addition:
+                    plugin_system_additions.append(addition)
+                ph = getattr(p, "hooks", None)
+                if ph:
+                    plugin_hooks_dicts.append(ph)
+
+        if real_tools_acc:
+            opts["tools"] = real_tools_acc
+        if builtin_names_acc:
+            opts.setdefault("extra", {})["builtin_tool_names"] = builtin_names_acc
+
+        # Append every plugin's system-prompt addition.
+        if plugin_system_additions:
+            base = opts.get("system") or ""
+            joined = "\n\n".join([base.strip(), *plugin_system_additions]).strip()
+            opts["system"] = joined
 
         if self.allowed_tools is not None:
             opts.setdefault("extra", {})["allowed_tools"] = self.allowed_tools
@@ -218,23 +249,31 @@ class ClaudeAgentOptions:
         if self.permission_mode is not None:
             opts["permission_mode"] = self.permission_mode
         # can_use_tool plumbing: build a PermissionContext so the agent
-        # loop actually invokes the callback at dispatch time. Without
+        # loop actually calls the callback at dispatch time. Without
         # this, ``ClaudeAgentOptions(can_use_tool=...)`` was silently
-        # accepted but never used.
+        # ignored — the field was accepted but the agent saw no
+        # permissions object.
         if self.can_use_tool is not None or self.permission_mode is not None:
-            from .permissions import PermissionContext  # local: avoid import cycle
+            from .permissions import PermissionContext  # local: cycle avoidance
 
             opts["permissions"] = PermissionContext(
                 mode=self.permission_mode or "default",
                 can_use_tool=self.can_use_tool,
             )
+        # Merge user-supplied hooks dict with any plugin-contributed dicts.
+        # User hooks win on per-event collision (set last in dict update).
+        combined_hooks: dict[str, list[Any]] = {}
+        for ph in plugin_hooks_dicts:
+            for event, matchers in ph.items():
+                combined_hooks.setdefault(event, []).extend(matchers)
         if self.hooks is not None:
-            # Convert Claude-style dict-of-event-name → list[HookMatcher]
-            # into our Hooks dataclass. Lazy import to avoid cycles.
-            from .hooks import Hooks
-            from . import claude_compat as _self  # noqa: PLW0406
+            for event, matchers in self.hooks.items():
+                combined_hooks[event] = list(matchers)
 
-            opts["hooks"] = _self._convert_hooks_dict(self.hooks)
+        if combined_hooks:
+            from . import claude_compat as _self  # noqa: PLW0406 — local cycle guard
+
+            opts["hooks"] = _self._convert_hooks_dict(combined_hooks)
 
         if self.max_budget_usd is not None:
             opts["max_usd"] = self.max_budget_usd
@@ -353,6 +392,11 @@ class ResultMessage(msgspec.Struct, omit_defaults=True):
     Flat fields exactly matching Claude Python SDK so
     ``msg.total_cost_usd`` / ``msg.num_turns`` / ``msg.subtype`` works
     verbatim.
+
+    ``permission_denials`` carries one dict per ``can_use_tool``-denied
+    call: ``{"tool_name": str, "tool_use_id": str, "tool_input": dict}``.
+    Empty list on a clean run. Lets a UI / audit layer inspect what the
+    permission system blocked without diffing the message stream.
     """
 
     subtype: str = "success"
@@ -364,13 +408,11 @@ class ResultMessage(msgspec.Struct, omit_defaults=True):
     stop_reason: str | None = None
     total_cost_usd: float = 0.0
     session_id: str = ""
-    # List of ``{tool_name, tool_use_id, tool_input}`` records for every
-    # tool call ``can_use_tool`` denied during the run. Matches
-    # claude_agent_sdk's ``ResultMessage.permission_denials`` so audit
-    # tooling that walks this field works unchanged.
     permission_denials: list[dict] = msgspec.field(default_factory=list)
-    # Per-turn usage rolled up. Populated when the agent had a budget
-    # tracker; otherwise zeros.
+    # Usage + per-model usage carried on the wire so a Claude SDK consumer
+    # can read ``msg.usage["input_tokens"]`` and
+    # ``msg.modelUsage[model]["costUSD"]`` directly. Empty dicts on a run
+    # where no usage was reported by the backend.
     usage: dict = msgspec.field(default_factory=dict)
     modelUsage: dict = msgspec.field(default_factory=dict)
 
@@ -507,6 +549,29 @@ class ClaudeSDKError(Exception):
     that the Claude SDK uses for ``CLIConnectionError`` and
     ``ProcessError``. We extend it as a sibling of our AgentError so
     callers can catch either."""
+
+
+@dataclass(slots=True)
+class Plugin:
+    """Drop-in for ``claude_agent_sdk.Plugin``.
+
+    A reusable bundle of (tools, system_prompt_addition, hooks). Pass a
+    list of these to ``ClaudeAgentOptions(plugins=[...])`` and the agent
+    will merge their contents at session start: every plugin's ``tools``
+    join the registry, the ``system_prompt_addition`` text is appended
+    to ``system_prompt``, and ``hooks`` are folded into the active
+    ``Hooks`` instance (last wins on per-event collision).
+
+    Distinct from MCP servers — plugins live in-process and bundle
+    Python-side state; MCP servers are external (or in-process via
+    ``create_sdk_mcp_server``) and exchange JSON-RPC.
+    """
+
+    name: str
+    version: str = "1.0.0"
+    tools: list[Tool] = field(default_factory=list)
+    system_prompt_addition: str | None = None
+    hooks: dict[str, list[Any]] | None = None
 
 
 @dataclass(slots=True)
