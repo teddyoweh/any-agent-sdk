@@ -170,12 +170,12 @@ class Agent:
         if self.temperature is None:
             self.temperature = self.model_capability.recommended_temperature
 
-        # Memory injection. Loads ~/.anyagent/MEMORY.md and prepends to the
-        # system prompt at session start. Mirrors Claude Code's behavior:
-        # the index is always in context, so the agent knows what memories
-        # exist before deciding which to read in full.
-        if self.include_memory:
-            self._inject_memory_into_system()
+        # Memory + user-context will be injected at run() time as a
+        # synthetic <system-reminder>-wrapped UserMessage with
+        # isMeta=True, NOT prepended to the system prompt. This matches
+        # Claude Code's mechanism (see system_reminder.py for the audit).
+        # The actual content is resolved lazily so a session that doesn't
+        # call run() pays nothing for it.
 
         # Wire safety surface.
         self._dispatcher = HookDispatcher(self.hooks or Hooks())
@@ -190,38 +190,53 @@ class Agent:
         if self.backend_capability is not None:
             self._provider_hint = self.backend_capability.provider_hint or None
 
-    def _inject_memory_into_system(self) -> None:
-        """Load ``~/.anyagent/MEMORY.md`` and prepend to ``self.system``.
+    @staticmethod
+    def _has_user_context_message(messages: list[Message]) -> bool:
+        """True if the first message is already a meta user-context message
+        — so re-calling ``run()`` doesn't double-inject."""
 
-        Silent no-op when the memory file is missing or empty — we don't
-        want the agent to fail just because the user hasn't written any
-        memory yet. The injected block is wrapped in a clear marker so
-        downstream prompts know what came from memory vs. user system.
+        if not messages:
+            return False
+        first = messages[0]
+        if not isinstance(first, UserMessage):
+            return False
+        return getattr(first, "isMeta", False) is True
+
+    def _build_user_context(self) -> dict[str, str]:
+        """Resolve the user-context dict that gets wrapped in a
+        ``<system-reminder>`` and prepended to the conversation.
+
+        Matches Claude SDK's ``getUserContext()`` shape — a flat
+        ``{key: value}`` dict. Currently populates one key:
+
+          * ``memory`` — contents of ``~/.anyagent/MEMORY.md`` if
+            ``include_memory`` is True
+
+        Extension point for future keys: ``claudeMd`` (project-local
+        ``CLAUDE.md`` walk), ``skills`` (always-loaded skills bundle),
+        custom keys via ``extra={"user_context": {...}}``.
         """
 
-        try:
-            from .memory import load_memory_index  # local import: optional dep on .anyagent
-            index = load_memory_index()
-        except Exception:  # noqa: BLE001 — disk I/O can fail in containers
-            _log.debug("memory load skipped (I/O error)", exc_info=True)
-            return
+        ctx: dict[str, str] = {}
 
-        if not index.strip():
-            return
+        if self.include_memory:
+            try:
+                from .memory import load_memory_index
+                index = load_memory_index().strip()
+                if index:
+                    ctx["memory"] = index
+            except Exception:  # noqa: BLE001 — disk I/O can fail in containers
+                _log.debug("memory load skipped (I/O error)", exc_info=True)
 
-        memory_block = (
-            "# Persistent memory (read-only index)\n\n"
-            "The following memory entries are available. They were written in\n"
-            "prior sessions. Treat them as ground truth about the user and\n"
-            "your past decisions. Read individual entry files via the\n"
-            "filesystem when relevant; the index below is loaded automatically.\n\n"
-            f"{index.strip()}\n"
-        )
+        # User-supplied extras flow through ``extra={"user_context": {...}}``.
+        if isinstance(self.extra, dict):
+            extra_ctx = self.extra.get("user_context")
+            if isinstance(extra_ctx, dict):
+                for k, v in extra_ctx.items():
+                    if isinstance(v, str) and v:
+                        ctx[k] = v
 
-        if self.system:
-            self.system = f"{memory_block}\n\n---\n\n{self.system}"
-        else:
-            self.system = memory_block
+        return ctx
 
     def _build_provider(self, ProviderCls: type[Provider], backend_kind: str) -> Provider:
         """Construct a provider with sensible defaults per backend kind."""
@@ -271,6 +286,17 @@ class Agent:
         """
 
         assert self._dispatcher is not None  # set in __post_init__
+
+        # Inject persistent user-context (memory + custom) as a synthetic
+        # ``<system-reminder>``-wrapped UserMessage at the head of the
+        # conversation. Matches Claude SDK 1:1. No-op when context is empty.
+        # We do this once per run() call; subsequent turns reuse the
+        # already-injected message.
+        if not self._has_user_context_message(messages):
+            user_ctx = self._build_user_context()
+            if user_ctx:
+                from .system_reminder import prepend_user_context  # local import
+                prepend_user_context(messages, user_ctx, in_place=True)
 
         for _ in range(self.max_steps):
             assistant = await self._one_turn(messages)

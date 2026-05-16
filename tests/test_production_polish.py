@@ -30,10 +30,25 @@ def tmp_anyagent_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return tmp_path
 
 
-def test_agent_loads_memory_index_into_system_prompt(
+def test_agent_injects_memory_as_system_reminder_user_message(
     tmp_anyagent_home: Path,
 ) -> None:
-    """When include_memory=True (default), MEMORY.md is prepended to system."""
+    """When include_memory=True (default), MEMORY.md is wrapped in a
+    ``<system-reminder>`` and injected as a synthetic isMeta user message
+    at the head of the conversation when ``run()`` is invoked. The system
+    prompt itself is left untouched — Claude SDK parity."""
+
+    from any_agent_sdk import UserMessage
+    from any_agent_sdk.events import (
+        ContentBlockDelta,
+        ContentBlockStart,
+        ContentBlockStop,
+        MessageDelta,
+        MessageStart,
+        MessageStop,
+        TextDelta,
+    )
+    from any_agent_sdk import TextBlock, Usage
 
     save_memory_entry(
         MemoryEntry(
@@ -46,61 +61,127 @@ def test_agent_loads_memory_index_into_system_prompt(
     )
     update_memory_index()
 
+    # Scripted MockProvider — emit a trivial assistant turn.
+    events = [
+        MessageStart(message_id="m1", model="qwen2.5-7b-instruct"),
+        ContentBlockStart(index=0, block=TextBlock(text="")),
+        ContentBlockDelta(index=0, delta=TextDelta(text="ok")),
+        ContentBlockStop(index=0),
+        MessageDelta(stop_reason="end_turn", usage=Usage(input_tokens=5, output_tokens=2)),
+        MessageStop(),
+    ]
     agent = Agent(
         model="qwen2.5-7b-instruct",
-        provider=MockProvider(),
+        provider=MockProvider(scripted_events=events),
         system="You are a helpful agent.",
     )
     try:
-        assert agent.system is not None
-        # The memory block is prepended.
-        assert "Persistent memory" in agent.system
-        assert "SF housing search" in agent.system
-        # The user's system is preserved after a separator.
-        assert "You are a helpful agent." in agent.system
-        assert agent.system.index("Persistent memory") < agent.system.index(
-            "You are a helpful agent."
+        # System prompt is UNTOUCHED.
+        assert agent.system == "You are a helpful agent."
+
+        messages: list = [UserMessage(content="hi")]
+        anyio.run(agent.run, messages)
+
+        # First message is now the meta context-injection user message.
+        first = messages[0]
+        assert isinstance(first, UserMessage)
+        assert first.isMeta is True
+        content = first.content if isinstance(first.content, str) else ""
+        assert "<system-reminder>" in content
+        assert "SF housing search" in content
+        # User's original turn is still there.
+        assert any(
+            isinstance(m, UserMessage) and m.content == "hi" and not m.isMeta
+            for m in messages
         )
     finally:
         anyio.run(agent.aclose)
 
 
-def test_agent_include_memory_false_skips_load(tmp_anyagent_home: Path) -> None:
-    """Opt out via include_memory=False; system prompt is untouched."""
+def test_agent_include_memory_false_skips_injection(
+    tmp_anyagent_home: Path,
+) -> None:
+    """Opt out via include_memory=False; no synthetic message is injected."""
+
+    from any_agent_sdk import UserMessage
+    from any_agent_sdk.events import (
+        ContentBlockDelta,
+        ContentBlockStart,
+        ContentBlockStop,
+        MessageDelta,
+        MessageStart,
+        MessageStop,
+        TextDelta,
+    )
+    from any_agent_sdk import TextBlock, Usage
 
     save_memory_entry(
-        MemoryEntry(
-            slug="x",
-            name="X",
-            description="x",
-            type="project",
-            body="x",
-        )
+        MemoryEntry(slug="x", name="X", description="x", type="project", body="x")
     )
     update_memory_index()
 
+    events = [
+        MessageStart(message_id="m1", model="m"),
+        ContentBlockStart(index=0, block=TextBlock(text="")),
+        ContentBlockDelta(index=0, delta=TextDelta(text="ok")),
+        ContentBlockStop(index=0),
+        MessageDelta(stop_reason="end_turn"),
+        MessageStop(),
+    ]
     agent = Agent(
         model="qwen2.5-7b-instruct",
-        provider=MockProvider(),
+        provider=MockProvider(scripted_events=events),
         system="Pristine system.",
         include_memory=False,
     )
     try:
+        messages: list = [UserMessage(content="hi")]
+        anyio.run(agent.run, messages)
+        # No meta user message inserted at head.
+        assert not (
+            isinstance(messages[0], UserMessage) and messages[0].isMeta
+        )
         assert agent.system == "Pristine system."
     finally:
         anyio.run(agent.aclose)
 
 
 def test_memory_missing_is_silent_noop(tmp_anyagent_home: Path) -> None:
-    """No MEMORY.md → agent constructs without raising; system unchanged."""
+    """No MEMORY.md → no injection; system prompt unchanged; no crash."""
 
+    from any_agent_sdk import UserMessage
+    from any_agent_sdk.events import (
+        ContentBlockDelta,
+        ContentBlockStart,
+        ContentBlockStop,
+        MessageDelta,
+        MessageStart,
+        MessageStop,
+        TextDelta,
+    )
+    from any_agent_sdk import TextBlock
+
+    events = [
+        MessageStart(message_id="m1", model="m"),
+        ContentBlockStart(index=0, block=TextBlock(text="")),
+        ContentBlockDelta(index=0, delta=TextDelta(text="ok")),
+        ContentBlockStop(index=0),
+        MessageDelta(stop_reason="end_turn"),
+        MessageStop(),
+    ]
     agent = Agent(
         model="qwen2.5-7b-instruct",
-        provider=MockProvider(),
+        provider=MockProvider(scripted_events=events),
         system="Original system.",
     )
     try:
+        messages: list = [UserMessage(content="hi")]
+        anyio.run(agent.run, messages)
         assert agent.system == "Original system."
+        # No meta message — empty memory means no injection.
+        assert not (
+            isinstance(messages[0], UserMessage) and messages[0].isMeta
+        )
     finally:
         anyio.run(agent.aclose)
 

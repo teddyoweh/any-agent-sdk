@@ -116,10 +116,18 @@ class SystemMessage(msgspec.Struct, omit_defaults=True):
 
 
 class UserMessage(msgspec.Struct, omit_defaults=True):
-    """User-authored or tool-result-bearing message."""
+    """User-authored or tool-result-bearing message.
+
+    ``isMeta=True`` flags synthetic messages produced by the SDK itself
+    (e.g. the ``<system-reminder>``-wrapped user-context block prepended
+    at session start, or attachment-surface reminders mid-turn). Mirrors
+    Claude SDK's ``SDKUserMessage.isSynthetic`` semantics — transcript
+    readers can skip these when counting visible turns.
+    """
 
     content: str | list[ContentBlock]
     role: Literal["user"] = "user"
+    isMeta: bool = False
 
 
 class AssistantMessage(msgspec.Struct, omit_defaults=True):
