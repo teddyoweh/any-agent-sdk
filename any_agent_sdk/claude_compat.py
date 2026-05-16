@@ -703,7 +703,31 @@ class ClaudeSDKClient:
             yield msg
 
     async def receive_response(self) -> AsyncIterator[Message]:
-        """Yield messages for the most-recently-queued prompt."""
+        """Yield messages for the most-recently-queued prompt.
+
+        Streaming-mode: messages are yielded AS the agent produces them,
+        not after the whole run completes.
+
+          * The ``SystemMessage(subtype='init')`` and the echo
+            ``UserMessage`` come out immediately, before any provider
+            call.
+          * Each :class:`AssistantMessage` lands the moment its turn's
+            stream finalizes. By that point the
+            :class:`StreamingToolExecutor` has already started
+            dispatching any tool calls in that turn (tool input JSON
+            closes mid-stream → dispatch fires before the assistant
+            ``MessageStop``).
+          * The :class:`UserMessage` carrying tool-result blocks lands
+            as soon as that batch finishes — *before* the next
+            assistant turn streams.
+          * The :class:`ResultMessage` is the final yield.
+
+        Mid-stream cancellation: :meth:`interrupt` fires the agent's
+        cancellation signal; cooperating tools and ``can_use_tool``
+        callbacks observe it on ``ToolPermissionContext.signal`` and
+        bail. The current turn finalizes; subsequent turns are not
+        started.
+        """
 
         prompt = self._pending_prompt
         if prompt is None:

@@ -122,9 +122,29 @@ async def query(
         else None
     )
 
+    # Track which seed messages have already been echoed to the consumer
+    # as UserMessage events above. ``run_iter`` may re-yield them (it can
+    # prepend a synthetic <system-reminder> UserMessage) — we want every
+    # NEW message it produces, but not duplicates of what we already
+    # streamed. The cheapest test: was this message instance already in
+    # ``seed_messages`` when we passed the list in?
+    seed_set = {id(m) for m in seed_messages}
+
     try:
-        messages = await agent.run(list(seed_messages))
-        for msg in messages[len(seed_messages):]:
+        running: list[Message] = list(seed_messages)
+        # Stream messages out as the agent produces them — assistant
+        # turns yield the moment their stream finalizes (tools are
+        # already dispatching in the background under the
+        # StreamingToolExecutor), and tool-result UserMessages yield as
+        # soon as the executor finishes a batch. This is the streaming-
+        # mode ``client.query()`` with mid-stream tool dispatch the
+        # roadmap calls for.
+        async for msg in agent.run_iter(running):
+            if id(msg) in seed_set:
+                # We already echoed this seed up front; skip the
+                # re-yield from run_iter (it surfaces seeds + injected
+                # meta context).
+                continue
             if isinstance(msg, _InternalAssistantMessage):
                 num_turns += 1
                 last_stop_reason = msg.stop_reason or last_stop_reason

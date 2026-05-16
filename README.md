@@ -223,7 +223,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] `CLIConnectionError`, `ClaudeSDKError`
 - [x] `ToolPermissionContext.signal` for cancellation (`anyio.Event`, fired by `Agent.cancel()`)
 - [x] `setting_sources` actually loading and persisting per source
-- [ ] Streaming-mode `client.query()` with mid-stream tool dispatch
+- [x] Streaming-mode `client.query()` with mid-stream tool dispatch
 
 **Backends**
 - [x] Ollama (native API + auto-routing from tag form)

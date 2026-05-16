@@ -312,31 +312,61 @@ class Agent:
     async def run(self, messages: list[Message]) -> list[Message]:
         """Run the full multi-turn loop and return the updated message list.
 
-        Drives the full integration:
-          * Streams the provider; assembles assistant message.
-          * For each ``tool_use`` in the assistant message, runs ``PreToolUse``
-            hook → checks permission → dispatches via
-            ``StreamingToolExecutor`` (parallel-safe partitioned).
-          * After the batch finishes, runs ``PostToolUse`` hook per call.
-          * Tracks token + USD usage on a ``BudgetTracker``; raises
-            ``BudgetExceededError`` when limits are crossed.
-          * Fires ``Stop`` when the assistant emits a turn with no tool calls.
+        Buffered wrapper around :meth:`run_iter`. ``messages`` is mutated in
+        place; the same list is returned for chaining. For mid-stream
+        consumption (yield each assistant turn + tool-result UserMessage
+        AS they finalize), use :meth:`run_iter` directly.
+        """
 
-        ``messages`` is mutated in place; the same list is returned for chaining.
+        async for _msg in self.run_iter(messages):
+            # run_iter mutates `messages` in place; we just drain it.
+            pass
+        return messages
+
+    async def run_iter(self, messages: list[Message]) -> AsyncIterator[Message]:
+        """Streaming-mode run loop: yield each new Message as it finalizes.
+
+        Yields, in order:
+          * The synthetic user-context ``UserMessage`` (``isMeta=True``) if
+            one is injected at the head of the conversation.
+          * One :class:`AssistantMessage` per turn, the moment that turn's
+            stream finishes assembling. The :class:`StreamingToolExecutor`
+            has already started dispatching its tool calls in parallel by
+            the time the yield happens (tool dispatch begins as soon as a
+            tool_use block's input JSON closes mid-stream — *not* after the
+            assistant message finalizes).
+          * One :class:`UserMessage` carrying the batch of
+            :class:`ToolResultBlock` s for each turn that requested tools.
+          * Nothing after the final natural-stop turn — callers use the
+            yielded AssistantMessage's ``stop_reason`` to detect end.
+
+        ``messages`` is mutated in place — every yielded item is also
+        appended to the list — so the caller can inspect the running
+        conversation between iterations.
+
+        Drives the full integration: PreToolUse / PostToolUse hooks,
+        permission checks (including ``PermissionResultAllow.updated_input``
+        rewrites), ``BudgetExceededError`` on turn / usd / token overruns,
+        and ``Stop`` hook fired on natural turn-end.
         """
 
         assert self._dispatcher is not None  # set in __post_init__
 
         # Inject persistent user-context (memory + custom) as a synthetic
         # ``<system-reminder>``-wrapped UserMessage at the head of the
-        # conversation. Matches Claude SDK 1:1. No-op when context is empty.
-        # We do this once per run() call; subsequent turns reuse the
-        # already-injected message.
+        # conversation. Matches Claude SDK 1:1. No-op when context is
+        # empty. We do this once per run_iter() call; subsequent turns
+        # reuse the already-injected message. Yield it so streaming-mode
+        # consumers can see what context the agent saw (and skip it via
+        # the ``isMeta`` flag if they're rendering to a UI).
         if not self._has_user_context_message(messages):
             user_ctx = self._build_user_context()
             if user_ctx:
                 from .system_reminder import prepend_user_context  # local import
                 prepend_user_context(messages, user_ctx, in_place=True)
+                # The first message is now the synthetic meta UserMessage.
+                if messages and isinstance(messages[0], UserMessage) and getattr(messages[0], "isMeta", False):
+                    yield messages[0]
 
         for _ in range(self.max_steps):
             assistant = await self._one_turn(messages)
@@ -353,6 +383,12 @@ class Agent:
                 # Enforce — raises BudgetExceededError if any limit is over.
                 self._budget_tracker.check()
 
+            # Yield the assistant turn the moment it's complete — before
+            # we synchronously block on tool execution. Consumers see the
+            # tool_use blocks immediately and can render "tool running…"
+            # state while ``_run_tool_batch`` does its parallel dispatch.
+            yield assistant
+
             tool_calls = [b for b in assistant.content if isinstance(b, ToolUseBlock)]
             if not tool_calls:
                 # Fire the Stop hook on natural turn-end (no tool follow-up).
@@ -360,14 +396,15 @@ class Agent:
                     "Stop",
                     HookContext(event="Stop", messages_snapshot=messages),
                 )
-                return messages
+                return
 
             # Run the tool batch through the streaming executor + safety net.
             results = await self._run_tool_batch(tool_calls, messages)
-            messages.append(UserMessage(content=list(results)))
+            tool_result_msg = UserMessage(content=list(results))
+            messages.append(tool_result_msg)
+            yield tool_result_msg
 
         _log.warning("agent hit max_steps=%d without natural stop", self.max_steps)
-        return messages
 
     async def _run_tool_batch(
         self,
