@@ -98,6 +98,59 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override the Ollama base URL.",
     )
 
+    p_setup_llamacpp = sub.add_parser(
+        "setup-local-llamacpp",
+        help=(
+            "Alternative to `setup-local` for users who prefer llama.cpp. "
+            "Downloads a curated GGUF from HuggingFace, prints the exact "
+            "`llama-server` command to start, and (if a server is already "
+            "up) runs a smoke test."
+        ),
+    )
+    p_setup_llamacpp.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Curated GGUF tag (e.g. qwen2.5-1.5b-instruct-q4_k_m). "
+            "Defaults to the recommended pick; use --list to see all options."
+        ),
+    )
+    p_setup_llamacpp.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_models",
+        help="List curated GGUF models and exit.",
+    )
+    p_setup_llamacpp.add_argument(
+        "--models-dir",
+        default=None,
+        help=(
+            "Directory to download GGUFs into. Defaults to "
+            "$ANY_AGENT_MODELS_DIR or the platform XDG data dir."
+        ),
+    )
+    p_setup_llamacpp.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Port the llama.cpp server runs on (smoke-test target). Default 8080.",
+    )
+    p_setup_llamacpp.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host the llama.cpp server binds to. Default loopback for safety.",
+    )
+    p_setup_llamacpp.add_argument(
+        "--skip-download",
+        action="store_true",
+        help="Don't download anything — just emit the launch command + smoke test.",
+    )
+    p_setup_llamacpp.add_argument(
+        "--skip-smoke-test",
+        action="store_true",
+        help="Skip the post-download verification request.",
+    )
+
     p_list = sub.add_parser(
         "list-models",
         help=(
@@ -538,6 +591,25 @@ def _cmd_setup_local(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_setup_local_llamacpp(args: argparse.Namespace) -> int:
+    from .setup_local_llamacpp import (  # noqa: PLC0415
+        print_gguf_model_table,
+        run_setup_local_llamacpp,
+    )
+
+    if getattr(args, "list_models", False):
+        print_gguf_model_table()
+        return 0
+    return run_setup_local_llamacpp(
+        model=args.model,
+        models_dir=args.models_dir,
+        port=args.port,
+        host=args.host,
+        skip_download=args.skip_download,
+        skip_smoke_test=args.skip_smoke_test,
+    )
+
+
 _HANDLERS: dict[str, Any] = {
     "version": _cmd_version,
     "list-models": _cmd_list_models,
@@ -545,6 +617,7 @@ _HANDLERS: dict[str, Any] = {
     "run": _cmd_run,
     "chat": _cmd_chat,
     "setup-local": _cmd_setup_local,
+    "setup-local-llamacpp": _cmd_setup_local_llamacpp,
 }
 
 
