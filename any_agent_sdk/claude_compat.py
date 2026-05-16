@@ -135,6 +135,23 @@ class ClaudeAgentOptions:
     include_memory: bool = True
     setting_sources: list[str] | None = None
 
+    # Diagnostics — Claude SDK exposes a ``stderr`` callable that
+    # receives every line the underlying CLI writes to stderr. For
+    # any-agent-sdk we don't shell out to a CLI, but we still accept the
+    # field so examples passing it don't TypeError. Lines from our
+    # logger get forwarded when set.
+    stderr: Callable[[str], Any] | None = None
+    # Same idea for ``stdin_input`` and other Claude SDK env knobs we
+    # haven't wired runtime behavior for yet.
+    stdin_input: str | None = None
+    env: dict[str, str] | None = None
+    user: str | None = None
+    permission_prompt_tool_name: str | None = None
+    continue_conversation: bool = False
+    resume: str | None = None
+    extra_args: dict[str, Any] | None = None
+    debug_stderr: bool = False
+
     # Misc passthroughs (kept on Agent.extra)
     extra: dict[str, Any] = field(default_factory=dict)
 
