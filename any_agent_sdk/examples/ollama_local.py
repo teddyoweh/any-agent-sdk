@@ -1,4 +1,4 @@
-"""Local Ollama example.
+"""Local Ollama example — uses ``query()`` for Claude SDK parity.
 
 Prereqs::
 
@@ -9,47 +9,48 @@ Run::
 
     python -m any_agent_sdk.examples.ollama_local
 
-Demonstrates: ``Agent`` against a fully-local backend, with one tool the model
-will call before answering.
+Demonstrates: ``query()`` against a fully-local Ollama backend, one
+tool the model invokes, persisted to ``~/.anyagent/sessions/`` via the
+``persist=True`` option.
 """
 
 from __future__ import annotations
 
 import asyncio
 
-from any_agent_sdk import Agent, UserMessage, tool
-from any_agent_sdk.providers.ollama import OllamaProvider
-from any_agent_sdk.tools import ToolRegistry
+from any_agent_sdk import query, tool
 
 
 @tool
 async def get_weather(city: str) -> str:
     """Return a one-line weather summary for the given city."""
 
-    # Stubbed — a real implementation would call a weather API. We hard-code so
-    # the example runs offline.
+    # Stubbed — a real implementation would call a weather API.
     return f"{city}: 67°F, partly cloudy."
 
 
 async def main() -> None:
-    registry = ToolRegistry()
-    registry.add(get_weather)
-
-    agent = Agent(
-        model="qwen2.5-7b-instruct",
-        provider=OllamaProvider(base_url="http://localhost:11434"),
-        tools=registry,
-        system="Reply in one sentence.",
-        max_tokens=256,
-    )
-    try:
-        messages = await agent.run(
-            [UserMessage(content="Weather in SF?")],
-        )
-        # The final assistant message is what the user would see.
-        print(messages[-1])
-    finally:
-        await agent.aclose()
+    async for msg in query(
+        prompt="Weather in SF?",
+        options={
+            "model": "qwen2.5-7b-instruct",
+            "backend": "http://localhost:11434",
+            "tools": [get_weather],
+            "system": "Reply in one sentence.",
+            "max_tokens": 256,
+            "max_turns": 3,
+            "persist": True,  # writes JSONL transcript to ~/.anyagent/sessions/
+        },
+    ):
+        if msg.type == "assistant":
+            for block in msg.message.content:
+                if hasattr(block, "text") and block.text:
+                    print(f"[assistant] {block.text}")
+        elif msg.type == "result":
+            print(
+                f"\n[result] {msg.subtype} · {msg.num_turns} turns · "
+                f"{msg.duration_ms} ms · ${msg.total_cost_usd:.4f}"
+            )
 
 
 if __name__ == "__main__":

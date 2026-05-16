@@ -1,4 +1,4 @@
-"""Hosted Fireworks example — DeepSeek-V3.
+"""Hosted Fireworks example — DeepSeek-V3 via ``query()``.
 
 Prereqs::
 
@@ -9,8 +9,8 @@ Run::
     python -m any_agent_sdk.examples.fireworks_hosted
 
 Fireworks speaks OpenAI-compat, so we use the same adapter as vLLM with a
-different base URL. DeepSeek-V3 has native tool calling, so this falls on
-Path A and the prompt-engineered fallback parser never fires.
+different base URL. DeepSeek-V3 has native tool calling, so this hits
+Path A — the prompt-engineered fallback parser never fires.
 """
 
 from __future__ import annotations
@@ -18,9 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 
-from any_agent_sdk import Agent, UserMessage, tool
-from any_agent_sdk.providers.openai_compat import OpenAICompatProvider
-from any_agent_sdk.tools import ToolRegistry
+from any_agent_sdk import query, tool
 
 
 @tool
@@ -31,30 +29,33 @@ async def lookup_company(name: str) -> str:
 
 
 async def main() -> None:
-    api_key = os.environ.get("FIREWORKS_API_KEY")
-    if not api_key:
+    if not os.environ.get("FIREWORKS_API_KEY"):
         raise SystemExit("Set FIREWORKS_API_KEY before running this example.")
 
-    registry = ToolRegistry()
-    registry.add(lookup_company)
-
-    agent = Agent(
-        model="accounts/fireworks/models/deepseek-v3",
-        provider=OpenAICompatProvider(
-            base_url="https://api.fireworks.ai/inference/v1",
-            api_key=api_key,
-        ),
-        tools=registry,
-        system="You are a research assistant. Use the tool when asked about companies.",
-        max_tokens=512,
-    )
-    try:
-        messages = await agent.run(
-            [UserMessage(content="Tell me about Spawn Labs in one sentence.")]
-        )
-        print(messages[-1])
-    finally:
-        await agent.aclose()
+    async for msg in query(
+        prompt="Tell me about Spawn Labs in one sentence.",
+        options={
+            "model": "accounts/fireworks/models/deepseek-v3",
+            "backend": "https://api.fireworks.ai/inference/v1",
+            "tools": [lookup_company],
+            "system": (
+                "You are a research assistant. Use the lookup_company tool "
+                "when asked about companies."
+            ),
+            "max_tokens": 512,
+            "max_turns": 3,
+        },
+    ):
+        if msg.type == "assistant":
+            for block in msg.message.content:
+                if hasattr(block, "text") and block.text:
+                    print(f"[assistant] {block.text}")
+        elif msg.type == "result":
+            print(
+                f"\n[result] {msg.subtype} · {msg.num_turns} turns · "
+                f"${msg.total_cost_usd:.4f} (in={msg.usage.input_tokens}, "
+                f"out={msg.usage.output_tokens})"
+            )
 
 
 if __name__ == "__main__":

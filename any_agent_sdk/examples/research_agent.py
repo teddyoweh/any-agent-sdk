@@ -1,19 +1,18 @@
 """Research agent — give a model two built-in tools (WebSearch + WebFetch)
-and ask it to research a subject.
+and ask it to research a subject. Uses ``query()`` (Claude SDK parity).
 
-Uses the SDK's built-in tools that are 1:1 with Claude Code's named tools.
-When ``EXA_API_KEY`` is set (recommended), search routes through Exa
-(neural, real URLs, ~$0.005/query). Without a key, falls back to scraping
-DuckDuckGo HTML.
+The SDK's built-in tools are 1:1 with Claude Code's named tools. When
+``EXA_API_KEY`` is set (recommended), WebSearch routes through Exa
+(neural, real URLs, ~$0.005/query). Without a key, falls back to Brave →
+Tavily → DuckDuckGo HTML scraping.
 
-Run with local Llama 3.2 on Ollama (the acceptance-test path):
+Run with local Llama 3.2 on Ollama (the acceptance-test path)::
 
-    ollama serve &
     ollama pull llama3.2:3b
     export EXA_API_KEY=...      # optional; better quality
     python -m any_agent_sdk.examples.research_agent "Subject Name"
 
-Or any hosted backend:
+Or any hosted backend::
 
     ANY_AGENT_BASE_URL=https://api.together.xyz/v1 \\
     ANY_AGENT_API_KEY=$TOGETHER_API_KEY \\
@@ -30,21 +29,17 @@ import sys
 from typing import Any
 
 from any_agent_sdk import (
-    Agent,
-    AssistantMessage,
-    TextBlock,
-    UserMessage,
     WebFetch,
     WebSearch,
+    query,
 )
 from any_agent_sdk.hooks import HookContext, HookResult, Hooks
-
 
 logging.basicConfig(level=logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
-# Live transcript hooks
+# Live transcript hooks — observable progress as the agent works
 # ---------------------------------------------------------------------------
 
 
@@ -65,18 +60,13 @@ def _short(obj: Any, n: int = 120) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Research loop
+# Research loop — query()-driven, with hooks for transparency
 # ---------------------------------------------------------------------------
 
 
-async def research(
-    subject: str,
-    model: str | None = None,
-    backend: str | None = None,
-    max_turns: int = 8,
-) -> str:
-    model = model or os.environ.get("ANY_AGENT_MODEL", "llama3.2:3b")
-    backend = backend or os.environ.get("ANY_AGENT_BASE_URL", "http://localhost:11434")
+async def research(subject: str, max_turns: int = 8) -> str:
+    model = os.environ.get("ANY_AGENT_MODEL", "llama3.2:3b")
+    backend = os.environ.get("ANY_AGENT_BASE_URL", "http://localhost:11434")
 
     provider = "Exa" if os.environ.get("EXA_API_KEY") else (
         "Brave" if os.environ.get("BRAVE_API_KEY") else (
@@ -88,46 +78,44 @@ async def research(
     print(f"    backend: {backend}")
     print(f"    search:  {provider}")
 
-    agent = Agent(
-        model=model,
-        backend=backend,
-        system=(
-            "You are a research assistant. The user names a subject — a "
-            "person, project, or topic. You have two tools:\n"
-            "  - WebSearch(query: str) — returns ranked results as "
-            "    TITLE — URL — SNIPPET lines. Pass ONLY the `query` argument; "
-            "    do NOT pass allowed_domains or blocked_domains unless the "
-            "    user explicitly asked for a domain filter.\n"
-            "  - WebFetch(url: str) — fetches a URL and returns its text. "
-            "    Pass ONLY the `url` argument.\n\n"
-            "Process:\n"
-            "  1. Call WebSearch with the subject name. Read every result line.\n"
-            "  2. If results look thin or off-topic, refine the query with an "
-            "     additional keyword (e.g. 'subject X profession' or 'subject "
-            "     site:github.com'). Search again.\n"
-            "  3. Pick the 1-2 most relevant URLs and WebFetch them.\n"
-            "  4. Write a factual 3-6 sentence summary citing the URLs you "
-            "     ACTUALLY fetched. Never invent facts. Never fabricate tool "
-            "     results — wait for the real tool output.\n"
-        ),
-        tools=[WebSearch, WebFetch],
-        max_tokens=512,
-        max_turns=max_turns,
-        temperature=0.2,
-        hooks=Hooks(pre_tool_use=trace_pre, post_tool_use=trace_post),
-    )
+    final_text = ""
+    async for msg in query(
+        prompt=f"Research {subject!r} and summarize what you find.",
+        options={
+            "model": model,
+            "backend": backend,
+            "tools": [WebSearch, WebFetch],
+            "system": (
+                "You are a research assistant. The user names a subject — a "
+                "person, project, or topic. You have two tools:\n"
+                "  - WebSearch(query: str) — returns ranked results as "
+                "    TITLE — URL — SNIPPET lines.\n"
+                "  - WebFetch(url: str) — fetches a URL and returns its text.\n\n"
+                "Process:\n"
+                "  1. WebSearch the subject name. Read every result line.\n"
+                "  2. If results look thin, refine the query and search again.\n"
+                "  3. Pick the 1-2 most relevant URLs and WebFetch them.\n"
+                "  4. Write a 3-6 sentence factual summary citing the URLs you "
+                "     actually fetched. Never invent facts.\n"
+            ),
+            "max_tokens": 512,
+            "max_turns": max_turns,
+            "temperature": 0.2,
+            "hooks": Hooks(pre_tool_use=trace_pre, post_tool_use=trace_post),
+            "persist": True,  # write to ~/.anyagent/sessions/
+        },
+    ):
+        if msg.type == "assistant":
+            for block in msg.message.content:
+                if hasattr(block, "text") and block.text:
+                    final_text = block.text
+        elif msg.type == "result":
+            print(
+                f"\n[result] {msg.subtype} · {msg.num_turns} turns · "
+                f"{msg.duration_ms} ms · ${msg.total_cost_usd:.4f}"
+            )
 
-    try:
-        msgs = await agent.run(
-            [UserMessage(content=f"Research {subject!r} and summarize what you find.")]
-        )
-    finally:
-        await agent.aclose()
-
-    final = msgs[-1]
-    if isinstance(final, AssistantMessage):
-        return "".join(b.text for b in final.content if isinstance(b, TextBlock))
-    return f"(no final assistant text; last message type: {type(final).__name__})"
+    return final_text or "(no final assistant text)"
 
 
 def main() -> None:

@@ -107,6 +107,29 @@ class APIUserMessage(msgspec.Struct):
 # ---------------------------------------------------------------------------
 
 
+def _tag_type(cls):
+    """Decorator: expose msgspec's tag value as a runtime ``.type`` property.
+
+    msgspec stores ``tag`` as serialization metadata only — it's not a Python
+    attribute on the instance. Consumers expect ``msg.type == "assistant"``
+    (Claude SDK parity), so we synthesize a property that reads
+    ``__struct_tag__`` (set by msgspec at class build time). For ``system``
+    subclasses, the property returns ``"system"`` and ``msg.subtype`` carries
+    the discriminator (``init`` / ``compact_boundary`` / ``status``), again
+    matching Claude SDK.
+    """
+
+    tag = cls.__struct_config__.tag  # set by msgspec when ``tag=...`` is used
+
+    @property
+    def _type(self) -> str:
+        return tag
+
+    cls.type = _type
+    return cls
+
+
+@_tag_type
 class SDKAssistantMessage(
     msgspec.Struct,
     tag="assistant",
@@ -122,6 +145,7 @@ class SDKAssistantMessage(
     error: str | None = None
 
 
+@_tag_type
 class SDKUserMessage(
     msgspec.Struct,
     tag="user",
@@ -138,6 +162,7 @@ class SDKUserMessage(
     tool_use_result: Any = None
 
 
+@_tag_type
 class SDKSystemMessage(
     msgspec.Struct,
     tag="system",
@@ -164,6 +189,7 @@ class SDKSystemMessage(
     session_id: str = ""
 
 
+@_tag_type
 class SDKCompactBoundaryMessage(
     msgspec.Struct,
     tag="system",
@@ -178,6 +204,7 @@ class SDKCompactBoundaryMessage(
     session_id: str = ""
 
 
+@_tag_type
 class SDKStatusMessage(
     msgspec.Struct,
     tag="system",
@@ -201,6 +228,7 @@ class SDKPermissionDenial(msgspec.Struct, omit_defaults=True):
     tool_input: dict[str, Any] = msgspec.field(default_factory=dict)
 
 
+@_tag_type
 class SDKResultMessage(
     msgspec.Struct,
     tag="result",
@@ -299,41 +327,61 @@ def _build_registry(tools: Any) -> ToolRegistry:
 
 
 def _agent_from_options(opts: dict[str, Any]) -> Agent:
-    """Construct an :class:`Agent` from a normalized options dict."""
+    """Construct an :class:`Agent` from a normalized options dict.
+
+    Recognized keys map 1:1 to :class:`Agent` constructor params; unknown
+    keys flow through to ``Agent.extra`` so adapters / hooks /
+    downstream features can read them without us growing constructor
+    parameters every release.
+    """
 
     model = opts.get("model")
     if not model:
         raise ValueError("query(options): 'model' is required")
 
-    backend = opts.get("backend")
-    registry = _build_registry(opts.get("tools"))
-
-    max_turns = opts.get("max_turns", opts.get("max_steps", 20))
-    max_tokens = opts.get("max_tokens", 1024)
-    temperature = opts.get("temperature")
-    system = opts.get("system")
-    max_usd = opts.get("max_usd")
-
-    extra: dict[str, Any] = {
-        k: v
-        for k, v in opts.items()
-        if k not in {
-            "model", "backend", "api_key", "tools", "max_turns", "max_steps",
-            "max_tokens", "temperature", "system", "max_usd",
-        }
+    # Recognized keys map to Agent constructor params.
+    agent_kwargs: dict[str, Any] = {
+        "model": model,
+        "backend": opts.get("backend"),
+        "system": opts.get("system"),
+        "tools": _build_registry(opts.get("tools")),
+        "max_tokens": opts.get("max_tokens", 1024),
+        "temperature": opts.get("temperature"),
+        "max_steps": opts.get("max_turns", opts.get("max_steps", 20)),
+        "max_usd": opts.get("max_usd"),
     }
 
-    return Agent(
-        model=model,
-        backend=backend,
-        system=system,
-        tools=registry,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        max_steps=max_turns,
-        max_usd=max_usd,
-        extra=extra or None,
-    )
+    # Optional pass-throughs — only forward when set so we don't override
+    # the dataclass defaults with None.
+    for key in (
+        "hooks",
+        "permissions",
+        "budget",
+        "include_memory",
+        "model_capability",
+        "backend_capability",
+        "provider",
+    ):
+        if key in opts:
+            agent_kwargs[key] = opts[key]
+
+    # Everything else goes on Agent.extra for adapter-specific knobs.
+    consumed = set(agent_kwargs.keys()) | {
+        "api_key",
+        "max_turns",
+        "max_steps",
+        "persist",
+        "session_id",
+        "cwd",
+        "permission_mode",
+        "mcp_servers",
+        "agents",
+    }
+    extra = {k: v for k, v in opts.items() if k not in consumed}
+    if extra:
+        agent_kwargs["extra"] = extra
+
+    return Agent(**agent_kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -1,26 +1,24 @@
-"""Multi-agent example — parent + research sub-agent.
+"""Multi-agent example — parent uses ``query()``; sub-agent is exposed as a tool.
 
-A small ``research_agent`` is exposed to the parent as a tool via
-``as_subagent_tool`` (from :mod:`any_agent_sdk.subagent`, built by a sibling
-module). The parent decides when to delegate; the sub-agent runs with its own
-budget and tool set.
+A small research sub-agent is wrapped via :func:`as_subagent_tool` and
+handed to the parent as a regular tool. The parent (driven by ``query()``)
+decides when to delegate. The sub-agent runs with its own budget + tool
+set and shares the parent's HTTP client pool by default.
 
 Run::
 
     python -m any_agent_sdk.examples.multi_agent_research
 
-If the ``subagent`` module hasn't landed in your checkout yet, this example
-prints a friendly message and exits cleanly — it is wired up to gracefully
-degrade rather than crash on import.
+The parent's session transcript persists to
+``~/.anyagent/sessions/<session_id>.jsonl`` via ``persist=True``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 
-from any_agent_sdk import Agent, UserMessage, tool
-from any_agent_sdk.providers.openai_compat import OpenAICompatProvider
-from any_agent_sdk.tools import ToolRegistry
+from any_agent_sdk import Agent, query, tool
 
 
 @tool
@@ -37,45 +35,53 @@ async def main() -> None:
         print("subagent module not present yet — skipping multi-agent example.")
         return
 
+    backend = os.environ.get("ANY_AGENT_BASE_URL", "http://localhost:11434")
+    model = os.environ.get("ANY_AGENT_MODEL", "qwen2.5-7b-instruct")
+
     # The research sub-agent: web-shaped tools, its own system prompt.
-    research_registry = ToolRegistry()
-    research_registry.add(fetch_url)
+    # Sub-agents still use the lower-level Agent class because they're
+    # invoked as tools — query() is for top-level conversations.
     research = Agent(
-        model="qwen2.5-7b-instruct",
-        provider=OpenAICompatProvider(base_url="http://localhost:8000/v1"),
-        tools=research_registry,
+        model=model,
+        backend=backend,
+        tools=[fetch_url],
         system="You are a research assistant. Fetch URLs and summarize.",
         max_tokens=512,
     )
 
-    # Parent: only knows about the sub-agent as a callable tool.
-    parent_registry = ToolRegistry()
-    parent_registry.add(
-        as_subagent_tool(
-            research,
-            name="research",
-            description="Delegate a research question to a specialist sub-agent.",
-        )
+    research_tool = as_subagent_tool(
+        research,
+        name="research",
+        description="Delegate a research question to a specialist sub-agent.",
     )
 
-    parent = Agent(
-        model="qwen2.5-7b-instruct",
-        provider=OpenAICompatProvider(base_url="http://localhost:8000/v1"),
-        tools=parent_registry,
-        system=(
-            "You are an orchestrator. For research-heavy questions, call the "
-            "'research' tool. For simple questions, answer directly."
-        ),
-        max_tokens=512,
-    )
-    try:
-        messages = await parent.run(
-            [UserMessage(content="What does Spawn Labs build? Use research if needed.")]
-        )
-        print(messages[-1])
-    finally:
-        await parent.aclose()
-        await research.aclose()
+    # Parent driven by query() — Claude SDK-compatible.
+    async for msg in query(
+        prompt="What does Spawn Labs build? Use the research tool if useful.",
+        options={
+            "model": model,
+            "backend": backend,
+            "tools": [research_tool],
+            "system": (
+                "You are an orchestrator. For research-heavy questions, call the "
+                "'research' tool. For simple questions, answer directly."
+            ),
+            "max_tokens": 512,
+            "max_turns": 5,
+            "persist": True,
+        },
+    ):
+        if msg.type == "assistant":
+            for block in msg.message.content:
+                if hasattr(block, "text") and block.text:
+                    print(f"[parent] {block.text}")
+        elif msg.type == "result":
+            print(
+                f"\n[result] {msg.subtype} · {msg.num_turns} parent turns · "
+                f"{msg.duration_ms} ms"
+            )
+
+    await research.aclose()
 
 
 if __name__ == "__main__":

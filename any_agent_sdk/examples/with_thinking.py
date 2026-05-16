@@ -1,35 +1,46 @@
 """Reasoning-model example — render thinking and final answer differently.
 
-QwQ-32B-Preview emits inline ``<think>...</think>`` blocks. The streaming
-pipeline splits these into ``ThinkingBlock`` deltas before the agent loop
-sees them; consumers can render thinking dimmed/collapsed while keeping the
-final assistant text loud.
+DeepSeek-R1, QwQ, R1-Distill, Marco-o1 etc. emit reasoning either inline
+(``<think>...</think>`` tags) or via Ollama's separate ``thinking``
+field. The streaming pipeline consolidates both into ``ThinkingBlock``
+deltas — consumers can render thinking dimmed/collapsed while keeping
+the final answer loud.
 
-Run::
+Uses the lower-level ``Agent.stream()`` API for token-by-token output
+(``query()`` yields whole SDKMessages, not raw event deltas).
 
+Run with local Ollama::
+
+    ollama pull deepseek-r1:1.5b
+    python -m any_agent_sdk.examples.with_thinking
+
+Or any backend serving a reasoning model::
+
+    ANY_AGENT_MODEL=qwq-32b-preview \\
+    ANY_AGENT_BASE_URL=http://localhost:8000/v1 \\
     python -m any_agent_sdk.examples.with_thinking
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 from any_agent_sdk import Agent, UserMessage
 from any_agent_sdk.events import ContentBlockDelta, TextDelta, ThinkingDelta
-from any_agent_sdk.providers.openai_compat import OpenAICompatProvider
 
 
-# ANSI dim/normal — keep the thinking visually distinct without depending on a
-# real TUI library. Falls back gracefully on terminals that don't support it.
+# ANSI dim/normal — keep the thinking visually distinct without depending on
+# a TUI library. Falls back gracefully on terminals that don't support ANSI.
 _DIM = "\x1b[2m"
 _RESET = "\x1b[0m"
 
 
 async def main() -> None:
     agent = Agent(
-        model="qwq-32b-preview",
-        provider=OpenAICompatProvider(base_url="http://localhost:8000/v1"),
+        model=os.environ.get("ANY_AGENT_MODEL", "deepseek-r1:1.5b"),
+        backend=os.environ.get("ANY_AGENT_BASE_URL", "http://localhost:11434"),
         system="Think carefully, then answer.",
         max_tokens=1024,
         temperature=0.6,
