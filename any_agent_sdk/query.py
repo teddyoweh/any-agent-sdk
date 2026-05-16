@@ -59,6 +59,7 @@ from .budget import lookup_pricing
 from .capabilities import lookup_model
 from .providers.base import Provider, detect_provider, resolve
 from .tools import Tool, ToolRegistry
+from .transcripts import JsonlTranscript
 from .types import (
     AssistantMessage,
     ContentBlock,
@@ -464,8 +465,24 @@ async def query(
     seeds = await _collect_prompt(prompt)
     started_at = time.monotonic()
 
+    # Persist to ~/.anyagent/sessions/{session_id}.jsonl when requested.
+    # Default: off — opt-in via options={"persist": True}. When on, every
+    # yielded SDKMessage is appended to the transcript before being
+    # yielded to the caller (so a crashed consumer doesn't lose history).
+    persist = bool(opts.get("persist", False))
+    transcript: JsonlTranscript | None = None
+    if persist:
+        transcript = JsonlTranscript(session_id)
+        transcript.open()
+
+    def _persist(msg: SDKMessage) -> SDKMessage:
+        """Persist-before-yield. Returns the message so call sites read naturally."""
+        if transcript is not None:
+            transcript.write(msg)
+        return msg
+
     # 1) Session-init banner.
-    yield SDKSystemMessage(
+    yield _persist(SDKSystemMessage(
         model=agent.model,
         tools=[t.name for t in agent.tools],
         cwd=opts.get("cwd", ""),
@@ -474,16 +491,16 @@ async def query(
         mcp_servers=opts.get("mcp_servers", []),
         uuid=_new_uuid(),
         session_id=session_id,
-    )
+    ))
 
     # 2) Seed user messages.
     for seed in seeds:
         if isinstance(seed, UserMessage):
-            yield SDKUserMessage(
+            yield _persist(SDKUserMessage(
                 message=APIUserMessage(content=seed.content),
                 uuid=_new_uuid(),
                 session_id=session_id,
-            )
+            ))
 
     # 3) Run the agent loop and translate each emitted message.
     is_error = False
@@ -523,25 +540,25 @@ async def query(
                     stop_reason=msg.stop_reason,
                     usage=msg.usage,
                 )
-                yield SDKAssistantMessage(
+                yield _persist(SDKAssistantMessage(
                     message=api_msg,
                     uuid=_new_uuid(),
                     session_id=session_id,
-                )
+                ))
                 text = _extract_text(msg.content)
                 if text:
                     final_text = text
             elif isinstance(msg, UserMessage):
                 # Tool-result-bearing user message produced by the loop.
-                yield SDKUserMessage(
+                yield _persist(SDKUserMessage(
                     message=APIUserMessage(content=msg.content),
                     uuid=_new_uuid(),
                     session_id=session_id,
                     isSynthetic=True,
-                )
+                ))
             elif isinstance(msg, SystemMessage):
                 content = msg.content if isinstance(msg.content, str) else ""
-                yield SDKSystemMessage(
+                yield _persist(SDKSystemMessage(
                     model=agent.model,
                     cwd=opts.get("cwd", ""),
                     tools=[t.name for t in agent.tools],
@@ -549,7 +566,7 @@ async def query(
                     output_style=content or None,
                     uuid=_new_uuid(),
                     session_id=session_id,
-                )
+                ))
     except Exception as e:  # noqa: BLE001 — wrap into result.errors
         is_error = True
         # Map our typed exceptions to upstream subtypes.
@@ -579,7 +596,7 @@ async def query(
             agent.model, agg_usage, backend_hint=backend_hint
         )
 
-    yield SDKResultMessage(
+    result_msg = SDKResultMessage(
         subtype=error_subtype,
         duration_ms=duration_ms,
         duration_api_ms=duration_ms,  # we don't separately track API time yet
@@ -595,6 +612,10 @@ async def query(
         uuid=_new_uuid(),
         session_id=session_id,
     )
+    if transcript is not None:
+        transcript.write(result_msg)
+        transcript.close()
+    yield result_msg
 
 
 __all__ = [

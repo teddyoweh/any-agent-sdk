@@ -35,6 +35,21 @@ from .events import (
     TextDelta,
     ThinkingDelta,
 )
+from .memory import (
+    MemoryEntry,
+    list_memory_entries,
+    load_memory_entry,
+    load_memory_index,
+    save_memory_entry,
+    update_memory_index,
+)
+from .paths import (
+    get_anyagent_dir,
+    get_memory_dir,
+    get_memory_index,
+    get_sessions_dir,
+    get_session_path,
+)
 from .query import (
     APIAssistantMessage,
     APIUserMessage,
@@ -47,6 +62,11 @@ from .query import (
     SDKSystemMessage,
     SDKUserMessage,
     query,
+)
+from .transcripts import (
+    JsonlTranscript,
+    iter_transcripts,
+    read_transcript,
 )
 from .tools import Tool, ToolRegistry, tool
 from .types import (

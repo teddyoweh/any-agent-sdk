@@ -69,6 +69,7 @@ from ..types import (
     Message,
     SystemMessage,
     TextBlock,
+    ThinkingBlock,
     ToolUseBlock,
     UserMessage,
     Usage,
@@ -307,6 +308,11 @@ class OllamaProvider(HTTPProviderMixin):
                                 yield out
                     else:
                         # Native path: pass content straight through.
+                        # Close any open thinking block first (R1-class
+                        # models stream thinking then text — order matters).
+                        if cursor.get("thinking_open"):
+                            yield ContentBlockStop(index=cursor["thinking_index"])
+                            cursor["thinking_open"] = False
                         if not cursor["text_open"]:
                             cursor["text_index"] = cursor["next_index"]
                             cursor["next_index"] += 1
@@ -320,12 +326,24 @@ class OllamaProvider(HTTPProviderMixin):
                             delta=TextDelta(text=content),
                         )
 
-                # Thinking — some Ollama builds expose a ``thinking`` field on
-                # the message for R1-class models served in reasoning mode.
+                # Thinking — DeepSeek-R1 (and other reasoning models served by
+                # Ollama) stream thinking as a separate ``thinking`` field
+                # on each NDJSON message. We open a dedicated ThinkingBlock
+                # content block for these so the agent loop sees them as
+                # first-class blocks, not as deltas into a non-existent text
+                # block.
                 thinking = msg.get("thinking")
                 if thinking:
+                    if not cursor.get("thinking_open"):
+                        cursor["thinking_index"] = cursor["next_index"]
+                        cursor["next_index"] += 1
+                        cursor["thinking_open"] = True
+                        yield ContentBlockStart(
+                            index=cursor["thinking_index"],
+                            block=ThinkingBlock(thinking=""),
+                        )
                     yield ContentBlockDelta(
-                        index=cursor["text_index"] if cursor["text_open"] else 0,
+                        index=cursor["thinking_index"],
                         delta=ThinkingDelta(thinking=thinking),
                     )
 
@@ -374,6 +392,9 @@ class OllamaProvider(HTTPProviderMixin):
                                 parser_emitted_tools = True
                             for out in _from_parser_event(parser_ev, cursor):
                                 yield out
+                    if cursor.get("thinking_open"):
+                        yield ContentBlockStop(index=cursor["thinking_index"])
+                        cursor["thinking_open"] = False
                     if cursor["text_open"] and cursor["text_index"] is not None:
                         yield ContentBlockStop(index=cursor["text_index"])
                         cursor["text_open"] = False
