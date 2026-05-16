@@ -36,14 +36,20 @@ from .events import (
     ThinkingDelta,
 )
 from .claude_compat import (
+    AgentDefinition,
+    CLIConnectionError,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    ClaudeSDKError,
     HookContext as ClaudeHookContext,
     HookInput,
     HookJSONOutput,
     HookMatcher,
     PermissionResult as ClaudePermissionResult,
+    PermissionResultAllow,
+    PermissionResultDeny,
     ResultMessage,
+    ToolPermissionContext,
     create_sdk_mcp_server,
 )
 # Pull SystemMessage from claude_compat as the canonical top-level name —

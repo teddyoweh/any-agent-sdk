@@ -67,9 +67,12 @@ from .types import (
 
 
 __all__ = [
+    "AgentDefinition",
     "AssistantMessage",
+    "CLIConnectionError",
     "ClaudeAgentOptions",
     "ClaudeSDKClient",
+    "ClaudeSDKError",
     "ContentBlock",
     "HookContext",
     "HookInput",
@@ -77,9 +80,12 @@ __all__ = [
     "HookMatcher",
     "Message",
     "PermissionResult",
+    "PermissionResultAllow",
+    "PermissionResultDeny",
     "ResultMessage",
     "SystemMessage",
     "TextBlock",
+    "ToolPermissionContext",
     "ToolResultBlock",
     "ToolUseBlock",
     "UserMessage",
@@ -134,6 +140,16 @@ class ClaudeAgentOptions:
     persist: bool = False
     include_memory: bool = True
     setting_sources: list[str] | None = None
+
+    # Agents — Claude SDK supports ``agents={"reviewer": AgentDefinition(...)}``
+    # which exposes named sub-agents the parent can call via the Task tool.
+    agents: dict[str, "AgentDefinition"] | None = None
+
+    # Plugins — Claude SDK exposes ``plugins=[Plugin(...)]``.
+    plugins: list[Any] | None = None
+
+    # Streaming knobs
+    include_partial_messages: bool = False
 
     # Diagnostics — Claude SDK exposes a ``stderr`` callable that
     # receives every line the underlying CLI writes to stderr. For
@@ -412,6 +428,83 @@ class PermissionResult:
     updated_input: dict[str, Any] | None = None
 
 
+@dataclass(slots=True)
+class PermissionResultAllow:
+    """Drop-in for ``claude_agent_sdk.PermissionResultAllow``.
+
+    Returned from a ``can_use_tool`` callback to authorize the call.
+    Optional ``updated_input`` rewrites the tool args before dispatch.
+    """
+
+    behavior: Literal["allow"] = "allow"
+    updated_input: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class PermissionResultDeny:
+    """Drop-in for ``claude_agent_sdk.PermissionResultDeny``.
+
+    Returned from ``can_use_tool`` to block the call. ``message`` is the
+    reason surfaced to the model in the tool_result block. ``interrupt``
+    halts the run when True (otherwise the model can recover by trying
+    another tool).
+    """
+
+    message: str
+    behavior: Literal["deny"] = "deny"
+    interrupt: bool = False
+
+
+@dataclass(slots=True)
+class ToolPermissionContext:
+    """Drop-in for ``claude_agent_sdk.ToolPermissionContext``.
+
+    Third argument passed to a ``can_use_tool`` callback. Carries the
+    session id, optional permission-rule context, and a free-form
+    ``signal`` field for cancellation/interruption (None in our impl
+    until we wire AbortController parity).
+    """
+
+    session_id: str = ""
+    signal: Any = None
+    suggestions: list[Any] = field(default_factory=list)
+
+
+class CLIConnectionError(Exception):
+    """Drop-in for ``claude_agent_sdk.CLIConnectionError``.
+
+    Raised when the underlying transport / model API can't be reached.
+    The Claude SDK examples catch this around the streaming-client
+    setup. We map it onto our existing :class:`ProviderError` family —
+    instances of CLIConnectionError ARE ProviderErrors so existing
+    catch blocks still work, and Claude SDK examples that catch
+    CLIConnectionError see the same surface.
+    """
+
+
+class ClaudeSDKError(Exception):
+    """Drop-in for ``claude_agent_sdk.ClaudeSDKError``. Base class
+    that the Claude SDK uses for ``CLIConnectionError`` and
+    ``ProcessError``. We extend it as a sibling of our AgentError so
+    callers can catch either."""
+
+
+@dataclass(slots=True)
+class AgentDefinition:
+    """Drop-in for ``claude_agent_sdk.AgentDefinition``.
+
+    Names a sub-agent the parent can delegate to via the ``Task`` tool
+    (Claude's terminology). Carries the description (when to use it),
+    the prompt (system prompt for the child), the allowed tools, and
+    optionally the model.
+    """
+
+    description: str
+    prompt: str
+    tools: list[str] = field(default_factory=list)
+    model: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # create_sdk_mcp_server alias
 # ---------------------------------------------------------------------------
@@ -455,10 +548,23 @@ class ClaudeSDKClient:
         self._pending_prompt: str | None = None
 
     async def __aenter__(self) -> ClaudeSDKClient:
+        await self.connect()
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
-        # Nothing persistent to close — each query() owns its own client.
+        await self.disconnect()
+
+    async def connect(self) -> None:
+        """Open the session. No-op for the in-process implementation — each
+        ``query()`` builds its own ``Agent`` — but matches the Claude SDK
+        public method so examples calling ``await client.connect()`` /
+        ``await client.disconnect()`` work unchanged."""
+
+        return None
+
+    async def disconnect(self) -> None:
+        """Close the session. See :meth:`connect`."""
+
         return None
 
     async def query(self, prompt: str) -> None:
@@ -466,6 +572,13 @@ class ClaudeSDKClient:
         ``receive_response()``."""
 
         self._pending_prompt = prompt
+
+    async def receive_messages(self) -> AsyncIterator[Message]:
+        """Alias for :meth:`receive_response`. Some Claude SDK examples
+        call this name."""
+
+        async for msg in self.receive_response():
+            yield msg
 
     async def receive_response(self) -> AsyncIterator[Message]:
         """Yield messages for the most-recently-queued prompt."""

@@ -228,15 +228,27 @@ def __getattr__(name: str) -> Any:
         "HookMatcher",
         "ResultMessage",
         "MessageType",
+        "ClaudeAgentOptions",
+        "PermissionResult",
+        "PermissionResultAllow",
+        "PermissionResultDeny",
+        "AgentDefinition",
+        "StreamEvent",
     }:
         from .claude_compat import (  # noqa: PLC0415
+            AgentDefinition as _AgentDefinition,
+            ClaudeAgentOptions as _ClaudeAgentOptions,
             HookContext as _HookContext,
             HookInput as _HookInput,
             HookJSONOutput as _HookJSONOutput,
             HookMatcher as _HookMatcher,
             Message as _MessageType,
+            PermissionResult as _PermissionResult,
+            PermissionResultAllow as _PermissionResultAllow,
+            PermissionResultDeny as _PermissionResultDeny,
             ResultMessage as _ResultMessage,
         )
+        from .events import StreamEvent as _StreamEvent  # noqa: PLC0415
 
         mapping = {
             "HookContext": _HookContext,
@@ -245,6 +257,12 @@ def __getattr__(name: str) -> Any:
             "HookMatcher": _HookMatcher,
             "ResultMessage": _ResultMessage,
             "MessageType": _MessageType,
+            "ClaudeAgentOptions": _ClaudeAgentOptions,
+            "PermissionResult": _PermissionResult,
+            "PermissionResultAllow": _PermissionResultAllow,
+            "PermissionResultDeny": _PermissionResultDeny,
+            "AgentDefinition": _AgentDefinition,
+            "StreamEvent": _StreamEvent,
         }
         return mapping[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

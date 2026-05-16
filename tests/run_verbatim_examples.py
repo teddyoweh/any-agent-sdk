@@ -33,9 +33,6 @@ EXAMPLES_TO_RUN: tuple[tuple[str, int], ...] = (
     ("tools_option.py", 90),
     ("max_budget_usd.py", 60),
     ("stderr_callback_example.py", 60),
-    # mcp_calculator runs 6 prompts × an LLM call each = slow on CPU.
-    # Cap aggressively; we just need the FIRST one to succeed for
-    # parity confirmation.
     ("mcp_calculator.py", 180),
 )
 
