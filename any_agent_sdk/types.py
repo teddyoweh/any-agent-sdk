@@ -142,12 +142,42 @@ Message = Union[SystemMessage, UserMessage, AssistantMessage]
 
 class Usage(msgspec.Struct, frozen=True, omit_defaults=True):
     """Token counts. Fields are optional because not every provider reports
-    every metric. ``cache_*`` are Anthropic-specific but kept here for clarity."""
+    every metric.
+
+    OSS backend semantics:
+      * Ollama exposes ``prompt_eval_count`` → ``input_tokens`` and
+        ``eval_count`` → ``output_tokens``. No cache fields.
+      * vLLM / Together / Fireworks / Groq emit OpenAI-shape ``usage``:
+        ``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``. No cache.
+      * DeepSeek's hosted API exposes prefix-cache token counts that map to
+        ``cache_read_input_tokens``.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
+
+
+class ModelUsage(msgspec.Struct, frozen=True, omit_defaults=True):
+    """Per-model usage record matching the Claude Agent SDK's ``ModelUsage``
+    schema verbatim (camelCase fields, since the wire format goes out to JS
+    consumers expecting Claude SDK output).
+
+    Aggregated into ``SDKResultMessage.modelUsage`` (a dict keyed by model
+    id) so multi-model runs (primary + fallback + summarizer) report each
+    model's contribution separately. All fields default to 0 so partial
+    reporting from OSS backends Just Works.
+    """
+
+    inputTokens: int = 0
+    outputTokens: int = 0
+    cacheReadInputTokens: int = 0
+    cacheCreationInputTokens: int = 0
+    webSearchRequests: int = 0
+    costUSD: float = 0.0
+    contextWindow: int = 0
+    maxOutputTokens: int = 0
 
 
 # ---------------------------------------------------------------------------

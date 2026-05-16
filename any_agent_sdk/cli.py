@@ -60,7 +60,30 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("version", help="Print the SDK version and exit.")
 
-    sub.add_parser("list-models", help="Print the bundled model capability table.")
+    p_list = sub.add_parser(
+        "list-models",
+        help=(
+            "List models. With --backend, probes the live server (Ollama "
+            "/api/tags, OpenAI-compat /v1/models, etc.) and annotates each "
+            "model with capability info. Without --backend, prints the "
+            "bundled 30-model capability table."
+        ),
+    )
+    p_list.add_argument(
+        "--backend",
+        default=None,
+        help="Backend base URL (e.g. http://localhost:11434, https://api.together.xyz/v1).",
+    )
+    p_list.add_argument(
+        "--api-key",
+        default=None,
+        help="Override API key (else uses env: TOGETHER_API_KEY, FIREWORKS_API_KEY, …).",
+    )
+    p_list.add_argument(
+        "--all",
+        action="store_true",
+        help="With --backend, also append the bundled table for reference.",
+    )
 
     p_probe = sub.add_parser(
         "probe", help="Hit a backend URL and report what we can detect."
@@ -116,11 +139,20 @@ def _cmd_version(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_list_models(_args: argparse.Namespace) -> int:
-    # Import lazily so other subcommands skip the table cost.
+def _cmd_list_models(args: argparse.Namespace) -> int:
+    """List models. With ``--backend``, queries the live server; without,
+    prints the bundled capability table."""
+
+    backend = getattr(args, "backend", None)
+    if backend:
+        return _list_backend_models(backend, args)
+
+    return _list_bundled_table()
+
+
+def _list_bundled_table() -> int:
     from .capabilities import _TABLE  # noqa: PLC0415 — intentional lazy import
 
-    # Column widths sized to fit the longest known model name.
     name_w = max(len(k) for k in _TABLE) + 2
     fmt = f"{{name:<{name_w}}} {{family:<10}} {{ctx:>8}} {{tools:^7}} {{think:^7}}"
     print(fmt.format(name="MODEL", family="FAMILY", ctx="CTX", tools="TOOLS", think="THINK"))
@@ -136,6 +168,135 @@ def _cmd_list_models(_args: argparse.Namespace) -> int:
             )
         )
     return 0
+
+
+def _list_backend_models(backend: str, args: argparse.Namespace) -> int:
+    """Probe a live backend and print every model it advertises.
+
+    Routes by ``detect_provider``:
+      * ``ollama``        → ``GET {base}/api/tags``
+      * ``openai_compat`` → ``GET {base}/v1/models`` (with optional auth)
+      * ``llamacpp``      → ``GET {base}/v1/models``
+      * ``tgi``           → ``GET {base}/info`` (single-model server)
+
+    Each row is annotated with what our capability table knows about it,
+    so users see size/context/tool-support next to the live name.
+    """
+
+    import os  # noqa: PLC0415
+    import httpx  # noqa: PLC0415
+
+    from .capabilities import lookup_model  # noqa: PLC0415
+
+    kind = detect_provider(backend)
+    base = backend.rstrip("/")
+    api_key = args.api_key or _resolve_api_key()
+
+    # Build the live-models call per backend kind.
+    models: list[dict[str, Any]] = []
+    try:
+        with httpx.Client(timeout=10.0) as c:
+            if kind == "ollama":
+                r = c.get(f"{base}/api/tags")
+                r.raise_for_status()
+                models = [
+                    {
+                        "name": m.get("name", ""),
+                        "size_gb": round((m.get("size") or 0) / 1e9, 2),
+                        "family": (m.get("details") or {}).get("family", ""),
+                        "params": (m.get("details") or {}).get("parameter_size", ""),
+                        "quant": (m.get("details") or {}).get("quantization_level", ""),
+                    }
+                    for m in r.json().get("models", [])
+                ]
+            elif kind == "tgi":
+                r = c.get(f"{base}/info")
+                r.raise_for_status()
+                info = r.json()
+                models = [
+                    {
+                        "name": info.get("model_id", "<tgi-served>"),
+                        "params": "",
+                        "quant": "",
+                    }
+                ]
+            else:  # openai_compat, llamacpp (with --jinja)
+                headers = (
+                    {"Authorization": f"Bearer {api_key}"} if api_key else {}
+                )
+                # /v1/models lives under the base url; strip a trailing /v1 if user gave one.
+                models_url = f"{base.rstrip('/v1')}/v1/models"
+                r = c.get(models_url, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+                models = [
+                    {"name": m.get("id", ""), "owned_by": m.get("owned_by", "")}
+                    for m in data.get("data", [])
+                ]
+    except httpx.HTTPError as e:
+        print(f"error probing backend {base!r}: {e!r}")
+        return 1
+
+    if not models:
+        print(f"{base}: no models reported")
+        return 0
+
+    # Pretty print: live name + size/params + our capability lookup
+    name_w = max(len(str(m.get("name", ""))) for m in models) + 2
+    fmt = (
+        f"{{name:<{name_w}}} {{size:>10}}  {{params:>10}}  "
+        "{tools:^7} {ctx:>8}"
+    )
+    print(f"{base}  ({kind}, {len(models)} model{'s' if len(models) != 1 else ''})")
+    print(fmt.format(name="MODEL", size="SIZE", params="PARAMS", tools="TOOLS", ctx="CTX"))
+    print("-" * (name_w + 44))
+    for m in models:
+        name = m.get("name", "")
+        cap = lookup_model(name)
+        size = (
+            f"{m['size_gb']} GB" if m.get("size_gb") else ""
+        )
+        params = m.get("params") or m.get("owned_by", "")
+        print(
+            fmt.format(
+                name=name,
+                size=size,
+                params=params,
+                tools="yes" if cap.supports_native_tools else "no",
+                ctx=str(cap.context_window),
+            )
+        )
+
+    if getattr(args, "all", False):
+        print()
+        print("=== bundled capability table ===")
+        _list_bundled_table()
+
+    return 0
+
+
+def _resolve_api_key() -> str | None:
+    """Best-effort: return whichever provider key is set in env."""
+
+    import os  # noqa: PLC0415
+
+    for var in (
+        "ANY_AGENT_API_KEY",
+        "OPENAI_API_KEY",
+        "TOGETHER_API_KEY",
+        "FIREWORKS_API_KEY",
+        "GROQ_API_KEY",
+        "OPENROUTER_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "DEEPINFRA_API_KEY",
+        "CEREBRAS_API_KEY",
+        "ANYSCALE_API_KEY",
+        "MOONSHOT_API_KEY",
+    ):
+        v = os.environ.get(var)
+        if v:
+            return v
+    return None
 
 
 def _cmd_probe(args: argparse.Namespace) -> int:

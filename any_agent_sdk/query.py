@@ -1,59 +1,108 @@
 """``query()`` — the drop-in wrapper.
 
-A thin generator over :class:`Agent` whose signature mirrors the upstream
-Claude Agent SDK so callers porting code can swap imports and not much else::
+Mirrors the Claude Agent SDK's public surface verbatim so a caller can
+swap ``from claude_agent_sdk import query`` for ``from any_agent_sdk import
+query`` and the rest of their code keeps working::
 
     from any_agent_sdk import query
 
     async for msg in query(
-        prompt="Hello!",
-        options={"model": "qwen2.5-7b-instruct", "backend": "http://localhost:11434"},
+        prompt="What is Spawn Labs?",
+        options={"model": "qwen2.5-72b-instruct", "backend": "https://api.together.xyz/v1"},
     ):
-        print(msg)
+        if msg["type"] == "result":
+            print(msg["result"], "$", msg["total_cost_usd"])
 
-Design notes
+SDK message schema
+------------------
+We follow Claude SDK's wire shape 1:1 (audited against the upstream zip,
+specifically ``entrypoints/sdk/coreSchemas.ts``):
+
+  * ``SDKAssistantMessage(type='assistant', message=APIAssistantMessage,
+                          parent_tool_use_id, uuid, session_id, error?)``
+  * ``SDKUserMessage(type='user', message=APIUserMessage,
+                     parent_tool_use_id, uuid?, session_id?)``
+  * ``SDKSystemMessage(type='system', subtype='init', ...)``
+  * ``SDKCompactBoundaryMessage(type='system', subtype='compact_boundary', ...)``
+  * ``SDKStatusMessage(type='system', subtype='status', status, permissionMode?)``
+  * ``SDKResultMessage`` (union of Success + Error subtypes) with:
+        type='result', subtype, duration_ms, duration_api_ms, is_error,
+        num_turns, result (success only) / errors (error only), stop_reason,
+        total_cost_usd, usage, modelUsage, permission_denials,
+        uuid, session_id
+
+The ``message`` field on assistant/user mirrors Anthropic's API message
+shape: ``{id, type, role, content, model, stop_reason, stop_sequence,
+usage}`` for assistants; ``{role, content}`` for users. This matches what
+upstream sees from the Anthropic SDK and what every Claude-SDK consumer
+expects.
+
+Options dict
 ------------
-* The options dict accepts both ``snake_case`` (idiomatic Python) and
-  ``camelCase`` (upstream parity) keys. We normalize via :func:`_to_snake`.
-* The yielded values are :class:`SDKMessage` msgspec structs — a tagged union
-  of assistant / user / system / result messages. They are *not* the same as
-  the internal :mod:`any_agent_sdk.types` messages; the wrapper translates so
-  consumers can switch between SDKs without diff churn.
-* The wrapper supports two prompt shapes: a plain ``str`` (single user turn),
-  or an ``AsyncIterable[SDKUserMessage]`` for streamed multi-turn input.
-* We finalize with an :class:`SDKResultMessage` carrying total cost (when
-  pricing is known) and number of turns — same fields upstream emits.
-
-What we deliberately do *not* implement here
---------------------------------------------
-* No partial-message / delta streaming. ``query`` yields whole messages, same
-  as upstream. Token-level streaming lives on ``Agent.stream``.
-* No interactive ``can_use_tool`` callback over the wire. ``options`` flows
-  through to ``Agent`` and ``Permissions`` directly when those modules land.
+Accepts snake_case AND camelCase keys for full Claude SDK parity:
+``max_turns`` / ``maxTurns``, ``allowed_tools`` / ``allowedTools``, etc.
+Normalized once via ``_to_snake``.
 """
 
 from __future__ import annotations
 
 import re
+import time
+import uuid as _uuid
 from collections.abc import AsyncIterable, AsyncIterator
 from typing import Any, Literal, Union
 
 import msgspec
 
 from .agent import Agent
+from .budget import lookup_pricing
+from .capabilities import lookup_model
 from .providers.base import Provider, detect_provider, resolve
 from .tools import Tool, ToolRegistry
 from .types import (
     AssistantMessage,
     ContentBlock,
     Message,
+    ModelUsage,
     SystemMessage,
     TextBlock,
+    Usage,
     UserMessage,
 )
 
 # ---------------------------------------------------------------------------
-# SDK message shapes (the wrapper's own surface — does not leak internal types)
+# API-shape message objects (mirror Anthropic SDK message shapes)
+# ---------------------------------------------------------------------------
+
+
+class APIAssistantMessage(msgspec.Struct):
+    """The ``message`` field of an SDKAssistantMessage. Matches the
+    ``anthropic.types.Message`` shape that Claude SDK forwards verbatim.
+
+    Wire format always includes ``role``, ``type``, ``content`` — JS
+    consumers check those fields directly, so we do NOT omit defaults.
+    """
+
+    id: str
+    role: Literal["assistant"] = "assistant"
+    type: Literal["message"] = "message"
+    content: list[ContentBlock] = msgspec.field(default_factory=list)
+    model: str = ""
+    stop_reason: str | None = None
+    stop_sequence: str | None = None
+    usage: Usage | None = None
+
+
+class APIUserMessage(msgspec.Struct):
+    """The ``message`` field of an SDKUserMessage. ``role`` is always
+    emitted on the wire — see APIAssistantMessage."""
+
+    role: Literal["user"] = "user"
+    content: str | list[ContentBlock] = ""
+
+
+# ---------------------------------------------------------------------------
+# SDK message variants
 # ---------------------------------------------------------------------------
 
 
@@ -61,53 +110,134 @@ class SDKAssistantMessage(
     msgspec.Struct,
     tag="assistant",
     tag_field="type",
-    omit_defaults=True,
 ):
-    """Final assistant turn. ``content_blocks`` mirrors the upstream shape."""
+    """One assistant turn. Wraps an ``APIAssistantMessage`` under ``message``,
+    same as Claude SDK."""
 
-    content_blocks: list[ContentBlock]
-    model: str = ""
-    stop_reason: str | None = None
+    message: APIAssistantMessage
+    parent_tool_use_id: str | None = None
+    uuid: str = ""
+    session_id: str = ""
+    error: str | None = None
 
 
 class SDKUserMessage(
     msgspec.Struct,
     tag="user",
     tag_field="type",
-    omit_defaults=True,
 ):
-    """User turn — either plain text or a list of content blocks (e.g. for
-    multi-modal or tool-result-bearing turns)."""
+    """One user turn (or tool-result-bearing turn appended by the agent
+    loop). Wraps an ``APIUserMessage`` under ``message``."""
 
-    content: str | list[ContentBlock]
+    message: APIUserMessage
+    parent_tool_use_id: str | None = None
+    uuid: str = ""
+    session_id: str = ""
+    isSynthetic: bool = False
+    tool_use_result: Any = None
 
 
 class SDKSystemMessage(
     msgspec.Struct,
     tag="system",
     tag_field="type",
-    omit_defaults=True,
 ):
-    """System prompt echoed back at the top of a streamed conversation. We
-    emit it once at the start when ``system`` is set."""
+    """Session-init banner. Fired once at the start of a stream.
 
-    content: str
+    Mirrors Claude SDK's ``SDKSystemMessage`` with ``subtype='init'``:
+    surfaces the active model, configured tools, mcp servers, permission
+    mode, and cwd so consumers can render a session header.
+    """
+
+    subtype: Literal["init"] = "init"
+    apiKeySource: str = "user"
+    cwd: str = ""
+    tools: list[str] = msgspec.field(default_factory=list)
+    mcp_servers: list[dict[str, Any]] = msgspec.field(default_factory=list)
+    model: str = ""
+    permissionMode: str = "default"
+    slug: str = "any-agent-sdk"
+    output_style: str | None = None
+    agents: list[str] = msgspec.field(default_factory=list)
+    uuid: str = ""
+    session_id: str = ""
+
+
+class SDKCompactBoundaryMessage(
+    msgspec.Struct,
+    tag="system",
+    tag_field="type",
+):
+    """Fired by the compactor when it summarizes older turns into a single
+    boundary message. Mirrors Claude SDK's ``SDKCompactBoundaryMessage``."""
+
+    subtype: Literal["compact_boundary"] = "compact_boundary"
+    compact_metadata: dict[str, Any] = msgspec.field(default_factory=dict)
+    uuid: str = ""
+    session_id: str = ""
+
+
+class SDKStatusMessage(
+    msgspec.Struct,
+    tag="system",
+    tag_field="type",
+):
+    """Mid-stream status nudge — ``status='compacting'`` while the compactor
+    runs, ``None`` when idle."""
+
+    subtype: Literal["status"] = "status"
+    status: str | None = None
+    permissionMode: str | None = None
+    uuid: str = ""
+    session_id: str = ""
+
+
+class SDKPermissionDenial(msgspec.Struct, omit_defaults=True):
+    """Carried on SDKResultMessage. Matches upstream field-for-field."""
+
+    tool_name: str
+    tool_use_id: str
+    tool_input: dict[str, Any] = msgspec.field(default_factory=dict)
 
 
 class SDKResultMessage(
     msgspec.Struct,
     tag="result",
     tag_field="type",
-    omit_defaults=True,
 ):
-    """Terminal message — fired after the last assistant turn. Matches the
-    upstream ``SDKResultMessage`` field-for-field."""
+    """Terminal message. ``subtype='success'`` for natural completion,
+    ``error_during_execution`` / ``error_max_turns`` / ``error_max_budget_usd``
+    / ``error_max_structured_output_retries`` for the error paths — same
+    vocabulary as Claude SDK so error-handling code ports without diffs.
 
-    result: str
-    is_error: bool = False
-    total_cost_usd: float = 0.0
-    num_turns: int = 0
+    ``result`` carries the final assistant text on success; ``errors`` carries
+    a list of human-readable error strings on the error subtypes. Both
+    fields are optional on the struct (omit_defaults=True) so consumers see
+    the upstream-shape wire output.
+
+    ``usage`` is the aggregate Usage for the whole run; ``modelUsage`` is a
+    per-model dict so multi-model runs report each model's contribution.
+    """
+
+    subtype: Literal[
+        "success",
+        "error_during_execution",
+        "error_max_turns",
+        "error_max_budget_usd",
+        "error_max_structured_output_retries",
+    ] = "success"
     duration_ms: int = 0
+    duration_api_ms: int = 0
+    is_error: bool = False
+    num_turns: int = 0
+    result: str = ""
+    stop_reason: str | None = None
+    total_cost_usd: float = 0.0
+    usage: Usage = msgspec.field(default_factory=Usage)
+    modelUsage: dict[str, ModelUsage] = msgspec.field(default_factory=dict)
+    permission_denials: list[SDKPermissionDenial] = msgspec.field(default_factory=list)
+    errors: list[str] = msgspec.field(default_factory=list)
+    uuid: str = ""
     session_id: str = ""
 
 
@@ -115,6 +245,8 @@ SDKMessage = Union[
     SDKAssistantMessage,
     SDKUserMessage,
     SDKSystemMessage,
+    SDKCompactBoundaryMessage,
+    SDKStatusMessage,
     SDKResultMessage,
 ]
 
@@ -142,31 +274,6 @@ def _normalize_options(opts: dict[str, Any] | None) -> dict[str, Any]:
     return {_to_snake(k): v for k, v in opts.items()}
 
 
-# Keys we explicitly recognize on options. Anything else is forwarded to the
-# Agent's ``extra`` bag so users can pass adapter-specific knobs without us
-# growing a constructor parameter every quarter.
-_AGENT_KEYS = frozenset(
-    {
-        "model",
-        "backend",
-        "system",
-        "tools",
-        "max_turns",
-        "max_tokens",
-        "temperature",
-        "max_usd",
-        "permission_mode",
-        "allowed_tools",
-        "disallowed_tools",
-        "hooks",
-        "mcp_servers",
-        "fallback_model",
-        "session_id",
-        "api_key",
-    }
-)
-
-
 # ---------------------------------------------------------------------------
 # Agent construction
 # ---------------------------------------------------------------------------
@@ -190,77 +297,42 @@ def _build_registry(tools: Any) -> ToolRegistry:
     return reg
 
 
-def _build_provider(
-    *,
-    model: str,
-    backend: str | None,
-    api_key: str | None,
-) -> Provider:
-    """Instantiate the right provider for ``(model, backend)`` pair.
-
-    Resolution mirrors :func:`providers.base.detect_provider`:
-      * explicit URL → matched against URL heuristics
-      * bare model name → defaults to ``openai_compat`` (local vLLM-style)
-    """
-
-    name = detect_provider(backend or model)
-    factory = resolve(name)
-    kwargs: dict[str, Any] = {}
-    if backend and backend.startswith(("http://", "https://")):
-        kwargs["base_url"] = backend
-    if api_key is not None:
-        kwargs["api_key"] = api_key
-    try:
-        return factory(**kwargs)  # type: ignore[call-arg]
-    except TypeError:
-        # Provider didn't accept one of our kwargs (e.g. mock). Fall back to no-arg.
-        return factory()  # type: ignore[call-arg]
-
-
-def _agent_from_options(opts: dict[str, Any]) -> tuple[Agent, dict[str, Any]]:
-    """Construct an :class:`Agent` from a normalized options dict.
-
-    Returns the agent plus the leftover keys we couldn't place — those go on
-    ``agent.extra`` so sibling features (hooks, permissions, budget) can read
-    them once they're built.
-    """
+def _agent_from_options(opts: dict[str, Any]) -> Agent:
+    """Construct an :class:`Agent` from a normalized options dict."""
 
     model = opts.get("model")
     if not model:
         raise ValueError("query(options): 'model' is required")
 
     backend = opts.get("backend")
-    api_key = opts.get("api_key")
-
-    provider = _build_provider(model=model, backend=backend, api_key=api_key)
     registry = _build_registry(opts.get("tools"))
 
-    # Map known options onto the Agent's constructor.
     max_turns = opts.get("max_turns", opts.get("max_steps", 20))
     max_tokens = opts.get("max_tokens", 1024)
     temperature = opts.get("temperature")
     system = opts.get("system")
+    max_usd = opts.get("max_usd")
 
-    # Stash anything the Agent doesn't natively understand. Hooks, permissions,
-    # mcp_servers, budget knobs etc. live here until those modules wire up.
-    extra: dict[str, Any] = {}
-    for k, v in opts.items():
-        if k in {"model", "backend", "api_key", "tools", "max_turns", "max_steps",
-                 "max_tokens", "temperature", "system"}:
-            continue
-        extra[k] = v
+    extra: dict[str, Any] = {
+        k: v
+        for k, v in opts.items()
+        if k not in {
+            "model", "backend", "api_key", "tools", "max_turns", "max_steps",
+            "max_tokens", "temperature", "system", "max_usd",
+        }
+    }
 
-    agent = Agent(
+    return Agent(
         model=model,
-        provider=provider,
+        backend=backend,
         system=system,
         tools=registry,
         max_tokens=max_tokens,
         temperature=temperature,
         max_steps=max_turns,
+        max_usd=max_usd,
         extra=extra or None,
     )
-    return agent, extra
 
 
 # ---------------------------------------------------------------------------
@@ -271,14 +343,6 @@ def _agent_from_options(opts: dict[str, Any]) -> tuple[Agent, dict[str, Any]]:
 async def _collect_prompt(
     prompt: str | AsyncIterable[Any],
 ) -> list[Message]:
-    """Turn the public ``prompt`` argument into a list of internal messages.
-
-    * ``str`` → one ``UserMessage``.
-    * ``AsyncIterable[SDKUserMessage | UserMessage | dict]`` → iterated and
-      each item converted to a ``UserMessage``. Dicts are interpreted leniently
-      so callers can pass plain JSON without a wrapper type.
-    """
-
     if isinstance(prompt, str):
         return [UserMessage(content=prompt)]
 
@@ -294,14 +358,78 @@ def _to_internal_user(item: Any) -> UserMessage:
     if isinstance(item, UserMessage):
         return item
     if isinstance(item, SDKUserMessage):
-        return UserMessage(content=item.content)
+        return UserMessage(content=item.message.content)
     if isinstance(item, dict):
-        # Accept upstream-shape dicts {"type": "user", "content": ...}.
+        if "message" in item and isinstance(item["message"], dict):
+            return UserMessage(content=item["message"].get("content", ""))
         if "content" in item:
             return UserMessage(content=item["content"])
     if isinstance(item, str):
         return UserMessage(content=item)
     raise TypeError(f"query(prompt): unsupported item type {type(item).__name__}")
+
+
+def _extract_text(blocks: list[ContentBlock]) -> str:
+    parts: list[str] = []
+    for b in blocks:
+        if isinstance(b, TextBlock):
+            parts.append(b.text)
+    return "".join(parts)
+
+
+def _new_uuid() -> str:
+    return str(_uuid.uuid4())
+
+
+# ---------------------------------------------------------------------------
+# Usage aggregation
+# ---------------------------------------------------------------------------
+
+
+def _accumulate_usage(
+    agg_usage: Usage,
+    msg_usage: Usage,
+) -> Usage:
+    """Sum tokens across turns. Cache fields take the latest non-zero value
+    because providers often report a single static prefix-cache count."""
+
+    return Usage(
+        input_tokens=agg_usage.input_tokens + msg_usage.input_tokens,
+        output_tokens=agg_usage.output_tokens + msg_usage.output_tokens,
+        cache_creation_input_tokens=(
+            msg_usage.cache_creation_input_tokens
+            or agg_usage.cache_creation_input_tokens
+        ),
+        cache_read_input_tokens=(
+            msg_usage.cache_read_input_tokens
+            or agg_usage.cache_read_input_tokens
+        ),
+    )
+
+
+def _to_model_usage(
+    model: str,
+    usage: Usage,
+    *,
+    backend_hint: str | None,
+) -> ModelUsage:
+    """Build a per-model ModelUsage record. Costs are computed from the
+    same per-model pricing table the BudgetTracker uses, so the
+    SDKResultMessage's modelUsage values agree with the budget tracker."""
+
+    pricing = lookup_pricing(model, backend_hint)
+    cost = pricing.cost(usage) if pricing is not None else 0.0
+    caps = lookup_model(model)
+    return ModelUsage(
+        inputTokens=usage.input_tokens,
+        outputTokens=usage.output_tokens,
+        cacheReadInputTokens=usage.cache_read_input_tokens,
+        cacheCreationInputTokens=usage.cache_creation_input_tokens,
+        webSearchRequests=0,  # the WebSearch built-in updates this externally
+        costUSD=cost,
+        contextWindow=caps.context_window,
+        maxOutputTokens=caps.max_output_tokens,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -314,82 +442,170 @@ async def query(
     prompt: str | AsyncIterable[Any],
     options: dict[str, Any] | None = None,
 ) -> AsyncIterator[SDKMessage]:
-    """Run an agent and yield SDK-shaped messages.
+    """Run an agent and yield Claude-SDK-shaped messages.
 
     Yields, in order:
-      1. ``SDKSystemMessage`` if ``options['system']`` was set.
+      1. ``SDKSystemMessage`` (subtype='init') with the session header.
       2. ``SDKUserMessage`` for each seed user message.
-      3. ``SDKAssistantMessage`` for each assistant turn produced.
-      4. ``SDKResultMessage`` once at the end.
+      3. ``SDKAssistantMessage`` / ``SDKUserMessage`` alternating, one per
+         agent turn (the latter for tool-result-bearing turns).
+      4. ``SDKResultMessage`` exactly once at the end (success or error
+         subtype).
 
-    The agent's HTTP client is closed before the final ``SDKResultMessage``
-    is yielded — callers don't need to manage lifecycle themselves.
+    Lifecycle: the underlying ``Agent``'s HTTP client is closed *before*
+    the final result message is yielded so consumers don't need to manage
+    cleanup.
     """
 
     opts = _normalize_options(options)
-    agent, _ = _agent_from_options(opts)
+    agent = _agent_from_options(opts)
 
+    session_id = opts.get("session_id") or _new_uuid()
     seeds = await _collect_prompt(prompt)
+    started_at = time.monotonic()
 
-    # Emit system + seed user messages up front so consumers can render the
-    # whole conversation from a single stream.
-    if agent.system:
-        yield SDKSystemMessage(content=agent.system)
+    # 1) Session-init banner.
+    yield SDKSystemMessage(
+        model=agent.model,
+        tools=[t.name for t in agent.tools],
+        cwd=opts.get("cwd", ""),
+        permissionMode=opts.get("permission_mode", "default"),
+        agents=opts.get("agents", []),
+        mcp_servers=opts.get("mcp_servers", []),
+        uuid=_new_uuid(),
+        session_id=session_id,
+    )
+
+    # 2) Seed user messages.
     for seed in seeds:
         if isinstance(seed, UserMessage):
-            yield SDKUserMessage(content=seed.content)
+            yield SDKUserMessage(
+                message=APIUserMessage(content=seed.content),
+                uuid=_new_uuid(),
+                session_id=session_id,
+            )
 
-    final_text = ""
+    # 3) Run the agent loop and translate each emitted message.
     is_error = False
+    error_subtype: Literal[
+        "success",
+        "error_during_execution",
+        "error_max_turns",
+        "error_max_budget_usd",
+    ] = "success"
+    error_strings: list[str] = []
     num_turns = 0
+    last_stop_reason: str | None = None
+    agg_usage = Usage()
+    model_usage: dict[str, ModelUsage] = {}
+    final_text = ""
+    backend_hint = (
+        agent.backend_capability.provider_hint
+        if agent.backend_capability is not None
+        else None
+    )
+
     try:
-        # Run the agent. ``run`` mutates ``seeds`` in place.
         messages = await agent.run(list(seeds))
-        # Skip back over the seeds; yield the assistant turns + any user
-        # tool-result turns the loop appended.
         for msg in messages[len(seeds):]:
             if isinstance(msg, AssistantMessage):
                 num_turns += 1
-                yield SDKAssistantMessage(
-                    content_blocks=list(msg.content),
+                last_stop_reason = msg.stop_reason or last_stop_reason
+                if msg.usage is not None:
+                    agg_usage = _accumulate_usage(agg_usage, msg.usage)
+                    prev = model_usage.get(agent.model)
+                    new_mu = _to_model_usage(agent.model, agg_usage, backend_hint=backend_hint)
+                    model_usage[agent.model] = new_mu
+                api_msg = APIAssistantMessage(
+                    id=_new_uuid(),
+                    content=list(msg.content),
                     model=agent.model,
                     stop_reason=msg.stop_reason,
+                    usage=msg.usage,
                 )
-                # Track the final visible text for the result message.
-                final_text = _extract_text(msg.content) or final_text
+                yield SDKAssistantMessage(
+                    message=api_msg,
+                    uuid=_new_uuid(),
+                    session_id=session_id,
+                )
+                text = _extract_text(msg.content)
+                if text:
+                    final_text = text
             elif isinstance(msg, UserMessage):
                 # Tool-result-bearing user message produced by the loop.
-                yield SDKUserMessage(content=msg.content)
+                yield SDKUserMessage(
+                    message=APIUserMessage(content=msg.content),
+                    uuid=_new_uuid(),
+                    session_id=session_id,
+                    isSynthetic=True,
+                )
             elif isinstance(msg, SystemMessage):
-                # Should not normally appear mid-stream, but pass through.
                 content = msg.content if isinstance(msg.content, str) else ""
-                yield SDKSystemMessage(content=content)
-    except Exception as e:  # noqa: BLE001
+                yield SDKSystemMessage(
+                    model=agent.model,
+                    cwd=opts.get("cwd", ""),
+                    tools=[t.name for t in agent.tools],
+                    permissionMode=opts.get("permission_mode", "default"),
+                    output_style=content or None,
+                    uuid=_new_uuid(),
+                    session_id=session_id,
+                )
+    except Exception as e:  # noqa: BLE001 — wrap into result.errors
         is_error = True
-        final_text = f"{type(e).__name__}: {e}"
+        # Map our typed exceptions to upstream subtypes.
+        from .errors import BudgetExceededError
+
+        if isinstance(e, BudgetExceededError):
+            error_subtype = (
+                "error_max_turns" if e.kind == "max_turns" else "error_max_budget_usd"
+            )
+        else:
+            error_subtype = "error_during_execution"
+        error_strings.append(f"{type(e).__name__}: {e}")
     finally:
         await agent.aclose()
 
+    duration_ms = int((time.monotonic() - started_at) * 1000)
+
+    # Pull total cost from the agent's tracker (if one exists).
+    total_cost_usd = 0.0
+    if agent._budget_tracker is not None:
+        total_cost_usd = agent._budget_tracker.total_usd
+
+    # If we never populated model_usage (e.g. no usage events emitted by the
+    # backend), fall back to the aggregate usage we tallied.
+    if not model_usage and (agg_usage.input_tokens or agg_usage.output_tokens):
+        model_usage[agent.model] = _to_model_usage(
+            agent.model, agg_usage, backend_hint=backend_hint
+        )
+
     yield SDKResultMessage(
-        result=final_text,
+        subtype=error_subtype,
+        duration_ms=duration_ms,
+        duration_api_ms=duration_ms,  # we don't separately track API time yet
         is_error=is_error,
-        total_cost_usd=0.0,  # populated by budget.py once it lands
         num_turns=num_turns,
+        result=final_text if not is_error else "",
+        errors=error_strings,
+        stop_reason=last_stop_reason,
+        total_cost_usd=total_cost_usd,
+        usage=agg_usage,
+        modelUsage=model_usage,
+        permission_denials=[],  # plumbing for this lands when permissions wire-up grows
+        uuid=_new_uuid(),
+        session_id=session_id,
     )
 
 
-def _extract_text(blocks: list[ContentBlock]) -> str:
-    parts: list[str] = []
-    for b in blocks:
-        if isinstance(b, TextBlock):
-            parts.append(b.text)
-    return "".join(parts)
-
-
 __all__ = [
+    "APIAssistantMessage",
+    "APIUserMessage",
     "SDKAssistantMessage",
+    "SDKCompactBoundaryMessage",
     "SDKMessage",
+    "SDKPermissionDenial",
     "SDKResultMessage",
+    "SDKStatusMessage",
     "SDKSystemMessage",
     "SDKUserMessage",
     "query",
