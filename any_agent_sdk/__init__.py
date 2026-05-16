@@ -134,6 +134,7 @@ __all__ = [
     "ModelCapability",
     "ModelUsage",
     "PermissionDeniedError",
+    "Plugin",
     "ProviderError",
     "RateLimitError",
     "SDKAssistantMessage",
