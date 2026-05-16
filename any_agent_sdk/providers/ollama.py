@@ -64,6 +64,11 @@ from ..streaming.text_tool_parser import (
     ToolCallStop as _ParserToolStop,
     ToolCallTextParser,
 )
+from ..streaming.thinking_parser import (
+    TextChunk as _ThinkTextChunk,
+    ThinkingChunk as _ThinkingChunk,
+    ThinkingParser,
+)
 from ..types import (
     AssistantMessage,
     Message,
@@ -240,7 +245,26 @@ class OllamaProvider(HTTPProviderMixin):
         # the SDK would never call a real tool.
         text_parser = None if use_native_tools else ToolCallTextParser()
 
-        async for ev in self._stream_ndjson(payload, model=model, text_parser=text_parser):
+        # When the model declares inline thinking tags (R1, QwQ,
+        # R1-Distill, Marco-o1, Hermes-Pro in reasoning mode, ...), route
+        # content through a ThinkingParser too. This handles the case where
+        # the model emits <think>...</think> INLINE in the text stream
+        # — distinct from Ollama's separate `thinking` field, which only
+        # fires when Ollama itself recognizes the model + serves it in
+        # reasoning mode. The two paths converge on the same normalized
+        # ThinkingBlock events upstream.
+        thinking_parser = None
+        if model_capability is not None and model_capability.emits_inline_thinking:
+            thinking_parser = ThinkingParser(
+                tags=model_capability.inline_thinking_tags
+            )
+
+        async for ev in self._stream_ndjson(
+            payload,
+            model=model,
+            text_parser=text_parser,
+            thinking_parser=thinking_parser,
+        ):
             yield ev
 
     async def _stream_ndjson(
@@ -249,6 +273,7 @@ class OllamaProvider(HTTPProviderMixin):
         *,
         model: str,
         text_parser: ToolCallTextParser | None = None,
+        thinking_parser: ThinkingParser | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Drive the Ollama /api/chat NDJSON stream.
 
@@ -299,32 +324,41 @@ class OllamaProvider(HTTPProviderMixin):
                 content = msg.get("content") or ""
 
                 if content:
-                    if text_parser is not None:
-                        # Prompt-engineered path: route every text chunk
-                        # through the parser; it emits TextChunk / ToolCall*
-                        # events that we translate to normalized StreamEvents.
-                        for parser_ev in text_parser.feed(content):
-                            for out in _from_parser_event(parser_ev, cursor):
+                    # Two parsers can stack: thinking-tag splitter first, then
+                    # tool-call splitter on the *text* portion only. Reasoning
+                    # is always non-tool content, so we never look for tool
+                    # calls inside a <think> block.
+                    for piece_kind, piece_text in _pipe_content(
+                        content, thinking_parser, finalize=False
+                    ):
+                        if piece_kind == "thinking":
+                            for out in _emit_thinking(piece_text, cursor):
                                 yield out
-                    else:
-                        # Native path: pass content straight through.
-                        # Close any open thinking block first (R1-class
-                        # models stream thinking then text — order matters).
-                        if cursor.get("thinking_open"):
-                            yield ContentBlockStop(index=cursor["thinking_index"])
-                            cursor["thinking_open"] = False
-                        if not cursor["text_open"]:
-                            cursor["text_index"] = cursor["next_index"]
-                            cursor["next_index"] += 1
-                            yield ContentBlockStart(
-                                index=cursor["text_index"],
-                                block=TextBlock(text=""),
-                            )
-                            cursor["text_open"] = True
-                        yield ContentBlockDelta(
-                            index=cursor["text_index"],
-                            delta=TextDelta(text=content),
-                        )
+                        else:
+                            # piece is plain text — close any open thinking
+                            # block first, then route through tool parser or
+                            # straight through.
+                            if cursor.get("thinking_open"):
+                                yield ContentBlockStop(index=cursor["thinking_index"])
+                                cursor["thinking_open"] = False
+                                cursor["thinking_index"] = None
+                            if text_parser is not None:
+                                for parser_ev in text_parser.feed(piece_text):
+                                    for out in _from_parser_event(parser_ev, cursor):
+                                        yield out
+                            else:
+                                if not cursor["text_open"]:
+                                    cursor["text_index"] = cursor["next_index"]
+                                    cursor["next_index"] += 1
+                                    yield ContentBlockStart(
+                                        index=cursor["text_index"],
+                                        block=TextBlock(text=""),
+                                    )
+                                    cursor["text_open"] = True
+                                yield ContentBlockDelta(
+                                    index=cursor["text_index"],
+                                    delta=TextDelta(text=piece_text),
+                                )
 
                 # Thinking — DeepSeek-R1 (and other reasoning models served by
                 # Ollama) stream thinking as a separate ``thinking`` field
@@ -384,8 +418,38 @@ class OllamaProvider(HTTPProviderMixin):
 
                 # Final chunk.
                 if chunk.get("done"):
-                    # Flush parser if present (handles unterminated text + tag).
+                    # Flush parsers if present (handles unterminated tags).
                     parser_emitted_tools = False
+                    if thinking_parser is not None:
+                        for piece_kind, piece_text in _pipe_content(
+                            "", thinking_parser, finalize=True
+                        ):
+                            if piece_kind == "thinking":
+                                for out in _emit_thinking(piece_text, cursor):
+                                    yield out
+                            else:
+                                # tail text — route through tool parser too.
+                                if cursor.get("thinking_open"):
+                                    yield ContentBlockStop(index=cursor["thinking_index"])
+                                    cursor["thinking_open"] = False
+                                    cursor["thinking_index"] = None
+                                if text_parser is not None:
+                                    for parser_ev in text_parser.feed(piece_text):
+                                        for out in _from_parser_event(parser_ev, cursor):
+                                            yield out
+                                else:
+                                    if not cursor["text_open"]:
+                                        cursor["text_index"] = cursor["next_index"]
+                                        cursor["next_index"] += 1
+                                        yield ContentBlockStart(
+                                            index=cursor["text_index"],
+                                            block=TextBlock(text=""),
+                                        )
+                                        cursor["text_open"] = True
+                                    yield ContentBlockDelta(
+                                        index=cursor["text_index"],
+                                        delta=TextDelta(text=piece_text),
+                                    )
                     if text_parser is not None:
                         for parser_ev in text_parser.finalize():
                             if isinstance(parser_ev, (_ParserToolStart, _ParserToolStop)):
@@ -441,6 +505,69 @@ def _render_block_as_text(blk: Any) -> str:
     if hasattr(blk, "source"):  # ImageBlock
         return "[image]"
     return ""
+
+
+def _pipe_content(
+    text: str,
+    thinking_parser: ThinkingParser | None,
+    *,
+    finalize: bool,
+) -> list[tuple[str, str]]:
+    """Route ``text`` through the (optional) thinking parser.
+
+    Yields ``("thinking", chunk)`` or ``("text", chunk)`` tuples. When
+    ``thinking_parser`` is None, the whole input is a single ``("text", ...)``.
+    When ``finalize=True``, also drains the parser's tail buffer (called
+    once at stream end).
+    """
+
+    out: list[tuple[str, str]] = []
+    if thinking_parser is None:
+        if text:
+            out.append(("text", text))
+        return out
+
+    for ev in thinking_parser.feed(text):
+        if isinstance(ev, _ThinkingChunk):
+            out.append(("thinking", ev.text))
+        elif isinstance(ev, _ThinkTextChunk):
+            out.append(("text", ev.text))
+    if finalize:
+        for ev in thinking_parser.finalize():
+            if isinstance(ev, _ThinkingChunk):
+                out.append(("thinking", ev.text))
+            elif isinstance(ev, _ThinkTextChunk):
+                out.append(("text", ev.text))
+    return out
+
+
+def _emit_thinking(text: str, cursor: dict[str, Any]) -> list[StreamEvent]:
+    """Translate a piece of thinking text into ContentBlockStart/Delta events.
+
+    Opens a fresh ThinkingBlock if none is open. Reuses the same block for
+    further pieces of thinking from the same reasoning span.
+    """
+
+    out: list[StreamEvent] = []
+    if not text:
+        return out
+    if not cursor.get("thinking_open"):
+        cursor["thinking_index"] = cursor["next_index"]
+        cursor["next_index"] += 1
+        cursor["thinking_open"] = True
+        out.append(
+            ContentBlockStart(
+                index=cursor["thinking_index"],
+                block=ThinkingBlock(thinking=""),
+            )
+        )
+    out.append(
+        ContentBlockDelta(
+            index=cursor["thinking_index"],
+            delta=ThinkingDelta(thinking=text),
+        )
+    )
+    return out
 
 
 def _from_parser_event(ev: Any, cursor: dict[str, Any]) -> list[StreamEvent]:

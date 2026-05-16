@@ -50,6 +50,17 @@ class ModelCapability:
     supports_grammar: bool = True  # most modern OSS backends support some form
     emits_thinking_blocks: bool = False
     emits_inline_thinking: bool = False
+    # Inline reasoning-tag pairs this model uses. The default covers the
+    # five tag conventions in the wild — providers/normalizers can pass
+    # this directly to ``ThinkingParser(tags=…)``. Only consulted when
+    # ``emits_inline_thinking`` is True.
+    inline_thinking_tags: tuple[tuple[str, str], ...] = (
+        ("<think>", "</think>"),
+        ("<thought>", "</thought>"),
+        ("<reasoning>", "</reasoning>"),
+        ("<thinking>", "</thinking>"),
+        ("<reflection>", "</reflection>"),
+    )
     context_window: int = 8192
     max_output_tokens: int = 4096
     chat_template_id: str = "chatml"
