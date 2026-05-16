@@ -49,21 +49,47 @@ def make_client(
     http2: bool = True,
     max_connections: int = 100,
     max_keepalive_connections: int = 20,
+    retries: bool = True,
 ) -> httpx.AsyncClient:
-    """Construct an httpx.AsyncClient tuned for streaming model APIs."""
+    """Construct an httpx.AsyncClient tuned for streaming model APIs.
+
+    ``retries=True`` (default) wraps the transport in
+    :class:`any_agent_sdk.retry.RetryTransport` so every provider gets
+    exponential-backoff retries on 429/5xx + connect/read timeouts +
+    ``Retry-After`` honoring. Set to ``False`` for tests where you want
+    deterministic failures.
+    """
 
     limits = httpx.Limits(
         max_connections=max_connections,
         max_keepalive_connections=max_keepalive_connections,
         keepalive_expiry=60.0,
     )
-    return httpx.AsyncClient(
+    transport: httpx.AsyncBaseTransport | None = None
+    if retries:
+        from .retry import RetryTransport  # local import: optional fast path
+
+        transport = RetryTransport(
+            httpx.AsyncHTTPTransport(http2=http2, retries=0, limits=limits),
+        )
+
+    kwargs: dict[str, Any] = dict(
         base_url=base_url,
         headers=headers or {},
         timeout=timeout,
-        http2=http2,
         limits=limits,
     )
+    if transport is not None:
+        kwargs["transport"] = transport
+    else:
+        # No retry middleware — let httpx manage the transport itself.
+        kwargs["http2"] = http2
+
+    return httpx.AsyncClient(
+        **kwargs,
+    )
+
+
 
 
 # ---------------------------------------------------------------------------

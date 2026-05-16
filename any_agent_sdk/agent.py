@@ -128,6 +128,12 @@ class Agent:
     budget: Budget | None = None
     max_usd: float | None = None  # shortcut: sets budget.max_usd if budget is None
 
+    # Memory — auto-loads ``~/.anyagent/MEMORY.md`` and prepends it to the
+    # system prompt. Matches Claude Code's behavior (the index is always in
+    # context; individual entries are loaded on demand via the memory tool).
+    # Set to False for tests / containerized runs where you don't want disk I/O.
+    include_memory: bool = True
+
     # Internal state populated in __post_init__ / run loop.
     _dispatcher: HookDispatcher | None = field(default=None, init=False)
     _budget_tracker: BudgetTracker | None = field(default=None, init=False)
@@ -164,6 +170,13 @@ class Agent:
         if self.temperature is None:
             self.temperature = self.model_capability.recommended_temperature
 
+        # Memory injection. Loads ~/.anyagent/MEMORY.md and prepends to the
+        # system prompt at session start. Mirrors Claude Code's behavior:
+        # the index is always in context, so the agent knows what memories
+        # exist before deciding which to read in full.
+        if self.include_memory:
+            self._inject_memory_into_system()
+
         # Wire safety surface.
         self._dispatcher = HookDispatcher(self.hooks or Hooks())
 
@@ -176,6 +189,39 @@ class Agent:
         # Provider hint for pricing lookups (e.g. "together", "fireworks").
         if self.backend_capability is not None:
             self._provider_hint = self.backend_capability.provider_hint or None
+
+    def _inject_memory_into_system(self) -> None:
+        """Load ``~/.anyagent/MEMORY.md`` and prepend to ``self.system``.
+
+        Silent no-op when the memory file is missing or empty — we don't
+        want the agent to fail just because the user hasn't written any
+        memory yet. The injected block is wrapped in a clear marker so
+        downstream prompts know what came from memory vs. user system.
+        """
+
+        try:
+            from .memory import load_memory_index  # local import: optional dep on .anyagent
+            index = load_memory_index()
+        except Exception:  # noqa: BLE001 — disk I/O can fail in containers
+            _log.debug("memory load skipped (I/O error)", exc_info=True)
+            return
+
+        if not index.strip():
+            return
+
+        memory_block = (
+            "# Persistent memory (read-only index)\n\n"
+            "The following memory entries are available. They were written in\n"
+            "prior sessions. Treat them as ground truth about the user and\n"
+            "your past decisions. Read individual entry files via the\n"
+            "filesystem when relevant; the index below is loaded automatically.\n\n"
+            f"{index.strip()}\n"
+        )
+
+        if self.system:
+            self.system = f"{memory_block}\n\n---\n\n{self.system}"
+        else:
+            self.system = memory_block
 
     def _build_provider(self, ProviderCls: type[Provider], backend_kind: str) -> Provider:
         """Construct a provider with sensible defaults per backend kind."""
