@@ -35,6 +35,23 @@ from .events import (
     TextDelta,
     ThinkingDelta,
 )
+from .claude_compat import (
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    HookContext as ClaudeHookContext,
+    HookInput,
+    HookJSONOutput,
+    HookMatcher,
+    PermissionResult as ClaudePermissionResult,
+    ResultMessage,
+    create_sdk_mcp_server,
+)
+# Pull SystemMessage from claude_compat as the canonical top-level name —
+# this is the flat-shape version with .subtype + .data that Claude SDK
+# examples use. Our internal SystemMessage (no subtype) is still
+# available via `from any_agent_sdk.types import SystemMessage as
+# InternalSystemMessage` if needed.
+from .claude_compat import SystemMessage  # type: ignore[assignment]  # overrides earlier import
 from .memory import (
     MemoryEntry,
     list_memory_entries,
@@ -82,7 +99,7 @@ from .types import (
     ContentBlock,
     Message,
     ModelUsage,
-    SystemMessage,
+    SystemMessage as InternalSystemMessage,  # keep accessible for advanced use
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,

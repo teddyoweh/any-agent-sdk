@@ -489,22 +489,41 @@ def _to_model_usage(
 async def query(
     *,
     prompt: str | AsyncIterable[Any],
-    options: dict[str, Any] | None = None,
-) -> AsyncIterator[SDKMessage]:
-    """Run an agent and yield Claude-SDK-shaped messages.
+    options: Any = None,
+) -> AsyncIterator[Any]:
+    """Run an agent and yield SDK-shaped messages.
 
-    Yields, in order:
-      1. ``SDKSystemMessage`` (subtype='init') with the session header.
-      2. ``SDKUserMessage`` for each seed user message.
-      3. ``SDKAssistantMessage`` / ``SDKUserMessage`` alternating, one per
-         agent turn (the latter for tool-result-bearing turns).
-      4. ``SDKResultMessage`` exactly once at the end (success or error
-         subtype).
+    Two output modes share this entry point:
+
+    1. **Claude Python SDK mode** (default for ``ClaudeAgentOptions`` or
+       ``options=None``): yields flat-shape ``AssistantMessage`` /
+       ``UserMessage`` / ``SystemMessage`` / ``ResultMessage`` matching
+       https://github.com/anthropics/claude-agent-sdk-python verbatim.
+
+    2. **TS SDK wire mode** (when ``options`` is a plain ``dict``): yields
+       ``SDKAssistantMessage`` / ``SDKResultMessage`` etc. with nested
+       ``.message`` for byte-perfect TS SDK wire compatibility.
+
+    Pass a :class:`~any_agent_sdk.ClaudeAgentOptions` (preferred) or a
+    dict. With no options, default model is ``$ANY_AGENT_MODEL`` else
+    ``"qwen2.5-7b-instruct"`` and default backend is ``$ANY_AGENT_BASE_URL``
+    else ``http://localhost:11434``.
 
     Lifecycle: the underlying ``Agent``'s HTTP client is closed *before*
     the final result message is yielded so consumers don't need to manage
     cleanup.
     """
+
+    # Claude Python SDK shape detection — ClaudeAgentOptions OR no options.
+    # When options is a plain dict, fall through to legacy TS-SDK shape so
+    # existing dict-shaped callers don't break.
+    _is_claude_compat = options is None or not isinstance(options, dict)
+    if _is_claude_compat:
+        from .compat_query import query as _compat_query
+
+        async for msg in _compat_query(prompt=prompt, options=options):
+            yield msg
+        return
 
     opts = _normalize_options(options)
     agent = _agent_from_options(opts)

@@ -89,35 +89,88 @@ class Tool:
 
 
 def tool(
-    fn: ToolFn | None = None,
+    fn_or_name: ToolFn | str | None = None,
+    description: str | None = None,
+    input_schema: dict[str, Any] | dict[str, type] | None = None,
     *,
     name: str | None = None,
-    description: str | None = None,
     is_concurrency_safe: Callable[[dict], bool] | bool = True,
     abort_siblings_on_error: bool = False,
     is_read_only: bool = False,
     timeout_s: float | None = None,
-    input_schema: dict[str, Any] | None = None,
     # Deprecated alias, accepted for backwards compat.
     parallel_safe: bool | None = None,
 ) -> Tool | Callable[[ToolFn], Tool]:
     """Decorator: turn an async function into a ``Tool``.
 
-    Usage::
+    **Two signatures are supported** for verbatim Claude SDK parity:
+
+    Pythonic (auto-derived schema)::
 
         @tool
         async def get_weather(city: str) -> str:
             \"\"\"Get current weather for a city.\"\"\"
             ...
 
-    Schema is auto-derived from type hints + docstring. Pass ``input_schema``
-    explicitly to override (useful for complex shapes). See the ``Tool``
-    dataclass docstring for the full field semantics.
+    Claude SDK form (positional name + description + schema, single
+    ``args: dict`` parameter, returns ``{"content": [...], "is_error"?}``)::
+
+        @tool("add", "Add two numbers", {"a": float, "b": float})
+        async def add_numbers(args: dict[str, Any]) -> dict[str, Any]:
+            return {"content": [{"type": "text", "text": str(args["a"] + args["b"])}]}
+
+    Both forms register the same ``Tool`` shape internally. The Claude
+    form's ``args: dict``-in, ``dict``-out signature is wrapped so that
+    when the agent dispatcher calls the tool with ``**kwargs``, we
+    repackage them into the ``args`` dict the Claude-style function
+    expects, then extract the ``content[0].text`` (or stringify the
+    whole result) as the result block content.
+
+    Schema for the Pythonic form is auto-derived from type hints. For the
+    Claude form, the ``{"a": float}`` dict is mapped to a JSON schema.
     """
 
-    # Resolve deprecated alias once.
+    # Resolve deprecated parallel_safe alias once.
     if parallel_safe is not None and is_concurrency_safe is True:
         is_concurrency_safe = bool(parallel_safe)
+
+    # Disambiguate the three valid first-arg shapes:
+    #   @tool                  (no-call, fn_or_name is the function)
+    #   @tool(name="x")        (kw-only, fn_or_name is None)
+    #   @tool("x", "desc", {}) (Claude positional, fn_or_name is a str)
+    claude_positional = (
+        isinstance(fn_or_name, str) or description is not None or input_schema is not None
+    )
+
+    if claude_positional:
+        tool_name = name or (fn_or_name if isinstance(fn_or_name, str) else None)
+        tool_desc = description or ""
+        raw_schema = input_schema or {}
+
+        def _wrap_claude(fn: ToolFn) -> Tool:
+            if not inspect.iscoroutinefunction(fn):
+                raise TypeError(f"@tool requires async def, got {fn!r}")
+            schema = (
+                _python_type_schema(raw_schema)
+                if raw_schema and not _looks_like_json_schema(raw_schema)
+                else (raw_schema or _derive_schema(fn))
+            )
+            wrapped = _wrap_claude_style_fn(fn)
+            return Tool(
+                name=tool_name or fn.__name__,
+                description=tool_desc or (inspect.getdoc(fn) or "").strip(),
+                input_schema=schema,
+                fn=wrapped,
+                is_concurrency_safe=is_concurrency_safe,
+                abort_siblings_on_error=abort_siblings_on_error,
+                is_read_only=is_read_only,
+                timeout_s=timeout_s,
+            )
+
+        return _wrap_claude
+
+    # Pythonic form (existing behavior).
+    fn = fn_or_name if callable(fn_or_name) else None
 
     def _wrap(fn: ToolFn) -> Tool:
         if not inspect.iscoroutinefunction(fn):
@@ -136,6 +189,61 @@ def tool(
     if fn is not None:
         return _wrap(fn)
     return _wrap
+
+
+# ---------------------------------------------------------------------------
+# Claude-style helpers
+# ---------------------------------------------------------------------------
+
+
+def _looks_like_json_schema(d: dict[str, Any]) -> bool:
+    """Heuristic: does ``d`` look like a JSON Schema (vs. Claude's
+    type-dict shorthand)?"""
+
+    return "type" in d and d.get("type") == "object"
+
+
+def _python_type_schema(d: dict[str, type]) -> dict[str, Any]:
+    """Convert Claude's shorthand ``{"a": float, "b": float}`` to a JSON
+    Schema ``{"type": "object", "properties": {...}, "required": [...]}``.
+    """
+
+    props: dict[str, Any] = {}
+    required: list[str] = []
+    for k, t in d.items():
+        props[k] = _type_to_schema(t)
+        required.append(k)
+    return {"type": "object", "properties": props, "required": required}
+
+
+def _wrap_claude_style_fn(fn: ToolFn) -> ToolFn:
+    """Wrap a Claude-style ``async def f(args: dict) -> dict`` so the
+    dispatcher's ``**kwargs`` call shape works.
+
+    Also unwraps the returned ``{"content": [{"type":"text","text":"…"}], …}``
+    dict into a plain string (which the dispatcher then puts into the
+    ``ToolResultBlock.content`` field).
+    """
+
+    async def _wrapper(**kwargs: Any) -> Any:
+        result = await fn(kwargs)
+        if isinstance(result, dict):
+            content = result.get("content")
+            if isinstance(content, list) and content:
+                # Concatenate text blocks; ignore image/resource for now.
+                texts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        texts.append(str(block.get("text", "")))
+                if texts:
+                    return "\n".join(texts)
+            if "text" in result:
+                return str(result["text"])
+        return result
+
+    _wrapper.__name__ = getattr(fn, "__name__", "claude_tool")
+    _wrapper.__doc__ = fn.__doc__
+    return _wrapper
 
 
 def _derive_schema(fn: ToolFn) -> dict[str, Any]:

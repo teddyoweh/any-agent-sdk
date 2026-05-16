@@ -202,3 +202,49 @@ def to_json(obj: Any) -> bytes:
     """Fast JSON encode using the shared encoder."""
 
     return ENCODE_MESSAGE.encode(obj)
+
+
+# ---------------------------------------------------------------------------
+# Claude Agent SDK compat — mirror ``claude_agent_sdk.types`` re-exports.
+# The canonical Claude SDK examples ``from claude_agent_sdk.types import
+# HookContext, HookInput, HookJSONOutput, HookMatcher, Message,
+# ResultMessage, AssistantMessage, TextBlock`` — we expose the same names
+# here so callers can swap the import and nothing else.
+# ---------------------------------------------------------------------------
+
+
+def __getattr__(name: str) -> Any:
+    """Module-level ``__getattr__`` for Claude-compat lazy attribute resolution.
+
+    Triggered when something does ``from any_agent_sdk.types import HookContext``
+    and the name isn't already a module global. We populate the compat names
+    on demand and re-resolve.
+    """
+
+    if name in {
+        "HookContext",
+        "HookInput",
+        "HookJSONOutput",
+        "HookMatcher",
+        "ResultMessage",
+        "MessageType",
+    }:
+        from .claude_compat import (  # noqa: PLC0415
+            HookContext as _HookContext,
+            HookInput as _HookInput,
+            HookJSONOutput as _HookJSONOutput,
+            HookMatcher as _HookMatcher,
+            Message as _MessageType,
+            ResultMessage as _ResultMessage,
+        )
+
+        mapping = {
+            "HookContext": _HookContext,
+            "HookInput": _HookInput,
+            "HookJSONOutput": _HookJSONOutput,
+            "HookMatcher": _HookMatcher,
+            "ResultMessage": _ResultMessage,
+            "MessageType": _MessageType,
+        }
+        return mapping[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
