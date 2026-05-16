@@ -1,0 +1,435 @@
+"""MCP JSON-RPC client.
+
+The client speaks the v0-relevant subset of the MCP protocol:
+
+* ``initialize`` (handshake; capture server capabilities + info)
+* ``notifications/initialized`` (post-handshake notice)
+* ``tools/list`` (discover tools)
+* ``tools/call`` (invoke a tool, returning ``CallToolResult``)
+* ``notifications/cancelled`` (best-effort cancellation of a request)
+
+Everything else — resources, prompts, sampling, logging — is out of scope
+for the v0 surface. They can be added by extending ``_request`` callers;
+the dispatcher already handles arbitrary methods.
+
+Concurrency model
+-----------------
+A single background task pumps the transport's ``receive()`` loop. Each
+incoming message is one of:
+
+* a *response* to a request we sent (``id`` matches an entry in
+  ``_pending``) — we stash the response and signal the awaiting task via
+  an ``anyio.Event``.
+* a *notification* from the server (no ``id``) — handled inline. v0
+  drops everything except ``notifications/cancelled``; future work hooks
+  ``notifications/progress`` and ``notifications/message`` into the agent's
+  hook system.
+* a *request* from the server (``id`` and ``method``) — v0 does not
+  expose server-initiated requests beyond elicitation. We log+ignore
+  unknown ones.
+
+Request ids are monotonic ints. A response carrying ``error`` raises
+``MCPError``. The special elicitation error code (-32042) is repackaged
+into ``MCPElicitationRequest`` so the agent loop can prompt the user.
+"""
+
+from __future__ import annotations
+
+import itertools
+from typing import Any
+
+import anyio
+import msgspec
+
+from ..errors import AgentError
+from .transports.base import Transport, TransportClosed
+from .transports.http import HttpTransport
+from .transports.in_process import InProcessTransport
+from .transports.sse import SseTransport
+from .transports.stdio import StdioTransport
+from .types import (
+    CallToolResult,
+    HttpServerConfig,
+    MCPTool,
+    SdkServerConfig,
+    ServerConfig,
+    SseServerConfig,
+    StdioServerConfig,
+)
+
+# JSON-RPC error code reserved by MCP for elicitation requests. The server
+# returns this code on tools/call when it needs the user to answer a
+# question or visit a URL mid-call. Spec is still in flux; -32042 is the
+# value the SDK currently uses.
+_ELICITATION_ERROR_CODE = -32042
+
+# MCP protocol version we negotiate. Servers advertise their version on
+# initialize; mismatched but compatible versions are common.
+_PROTOCOL_VERSION = "2025-03-26"
+
+
+# ---------------------------------------------------------------------------
+# Errors
+# ---------------------------------------------------------------------------
+
+
+class MCPError(AgentError):
+    """A JSON-RPC error response from an MCP server."""
+
+    __slots__ = ("code", "raw_data")
+
+    def __init__(self, code: int, message: str, data: Any = None):
+        super().__init__(f"mcp error {code}: {message}")
+        self.code = code
+        self.raw_data = data
+
+
+class MCPElicitationRequest(AgentError):
+    """The MCP server is asking the user for input mid-tool-call.
+
+    v0 just surfaces this exception; the agent loop should catch it and
+    prompt the user (or surface to its caller) per the M3 elicitation
+    handler. The ``params`` dict is the raw elicitation payload from the
+    server — typically a ``message``, optional ``schema`` for structured
+    answers, and an ``id`` for the response.
+    """
+
+    __slots__ = ("params",)
+
+    def __init__(self, params: dict[str, Any]):
+        message = params.get("message") or "mcp server requested user input"
+        super().__init__(f"mcp elicitation: {message}")
+        self.params = params
+
+
+class MCPProtocolError(AgentError):
+    """The server returned a structurally invalid message."""
+
+
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
+
+
+_DECODER = msgspec.json.Decoder()
+
+
+class MCPClient:
+    """Connect to one MCP server, list its tools, call them.
+
+    Use as an async context manager::
+
+        async with MCPClient(StdioServerConfig(command="my-mcp")) as client:
+            tools = await client.list_tools()
+            result = await client.call_tool("echo", {"text": "hi"})
+
+    The client owns its transport and its read loop. Concurrent calls from
+    multiple tasks are safe — every request gets a unique id and waits on
+    its own event.
+    """
+
+    __slots__ = (
+        "config",
+        "server_id",
+        "server_info",
+        "server_capabilities",
+        "_transport",
+        "_id_counter",
+        "_pending",
+        "_task_group",
+        "_closed",
+        "_initialized",
+    )
+
+    def __init__(self, config: ServerConfig, *, server_id: str | None = None) -> None:
+        self.config = config
+        # Stable id used by MCPTool.server_id. Falls back to a synthetic
+        # name based on transport type when the config doesn't carry one.
+        self.server_id = server_id or _derive_server_id(config)
+        self.server_info: dict[str, Any] = {}
+        self.server_capabilities: dict[str, Any] = {}
+        self._transport: Transport | None = None
+        self._id_counter = itertools.count(1)
+        self._pending: dict[int, _PendingRequest] = {}
+        self._task_group: anyio.abc.TaskGroup | None = None
+        self._closed = False
+        self._initialized = False
+
+    # -- lifecycle ----------------------------------------------------------
+
+    async def __aenter__(self) -> "MCPClient":
+        self._transport = await _open_transport(self.config)
+        self._task_group = anyio.create_task_group()
+        await self._task_group.__aenter__()
+        self._task_group.start_soon(self._read_loop)
+        await self._initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        # Fail any in-flight waiters cleanly.
+        for pending in list(self._pending.values()):
+            pending.error = TransportClosed("MCP client closing")
+            pending.event.set()
+        self._pending.clear()
+        if self._transport is not None:
+            try:
+                await self._transport.close()
+            except Exception:  # noqa: BLE001 — best-effort
+                pass
+        if self._task_group is not None:
+            try:
+                self._task_group.cancel_scope.cancel()
+                await self._task_group.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # -- public API ---------------------------------------------------------
+
+    async def list_tools(self) -> list[MCPTool]:
+        """Call ``tools/list`` and return the parsed tool definitions.
+
+        Pagination (``cursor``) is honored: we loop until the server stops
+        sending a ``nextCursor``. Most servers fit in a single response.
+        """
+
+        tools: list[MCPTool] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self._request("tools/list", params)
+            for raw in result.get("tools", []):
+                if not isinstance(raw, dict):
+                    continue
+                tools.append(
+                    MCPTool(
+                        name=str(raw.get("name", "")),
+                        description=str(raw.get("description", "")),
+                        # MCP uses ``inputSchema``; we normalize to snake_case.
+                        input_schema=raw.get("inputSchema") or {},
+                        server_id=self.server_id,
+                    )
+                )
+            cursor = result.get("nextCursor")
+            if not cursor:
+                break
+        return tools
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        timeout_s: float = 60.0,
+    ) -> CallToolResult:
+        """Invoke ``tools/call``. Returns the parsed ``CallToolResult``.
+
+        Honors ``timeout_s`` via ``anyio.fail_after``; on timeout the client
+        sends ``notifications/cancelled`` to the server (best-effort) and
+        raises ``TimeoutError``. ``MCPElicitationRequest`` bubbles when the
+        server returns elicitation error code -32042.
+        """
+
+        request_id = next(self._id_counter)
+        pending = _PendingRequest()
+        self._pending[request_id] = pending
+
+        await self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+
+        try:
+            with anyio.fail_after(timeout_s):
+                await pending.event.wait()
+        except TimeoutError:
+            # Best-effort cancellation notice. Server may or may not honor.
+            self._pending.pop(request_id, None)
+            await self._notify(
+                "notifications/cancelled",
+                {"requestId": request_id, "reason": "client timeout"},
+            )
+            raise
+
+        self._pending.pop(request_id, None)
+        if pending.error is not None:
+            raise pending.error
+        if pending.response is None:
+            raise MCPProtocolError("MCP server returned no response payload")
+
+        if "error" in pending.response:
+            err = pending.response["error"]
+            code = int(err.get("code", 0))
+            message = str(err.get("message", "")) or "unknown error"
+            data = err.get("data")
+            if code == _ELICITATION_ERROR_CODE:
+                params = data if isinstance(data, dict) else {"message": message}
+                raise MCPElicitationRequest(params)
+            raise MCPError(code, message, data)
+
+        result = pending.response.get("result")
+        if not isinstance(result, dict):
+            raise MCPProtocolError("tools/call result was not an object")
+        return CallToolResult(
+            content=list(result.get("content") or []),
+            is_error=bool(result.get("isError", False)),
+        )
+
+    # -- handshake ----------------------------------------------------------
+
+    async def _initialize(self) -> None:
+        result = await self._request(
+            "initialize",
+            {
+                "protocolVersion": _PROTOCOL_VERSION,
+                "capabilities": {
+                    # We don't currently advertise client-side features
+                    # (sampling, roots, etc.) — but the field must be a
+                    # dict per spec.
+                },
+                "clientInfo": {
+                    "name": "any-agent-sdk",
+                    "version": "0.1.0",
+                },
+            },
+        )
+        self.server_info = result.get("serverInfo") or {}
+        self.server_capabilities = result.get("capabilities") or {}
+        # Post-handshake notice. Required by the spec before any other call.
+        await self._notify("notifications/initialized", {})
+        self._initialized = True
+
+    # -- wire helpers -------------------------------------------------------
+
+    async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Send a request and wait for its response. Raises ``MCPError`` on
+        error responses."""
+
+        request_id = next(self._id_counter)
+        pending = _PendingRequest()
+        self._pending[request_id] = pending
+        await self._send(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        )
+        await pending.event.wait()
+        self._pending.pop(request_id, None)
+        if pending.error is not None:
+            raise pending.error
+        if pending.response is None:
+            raise MCPProtocolError(f"MCP server returned no response for {method!r}")
+        if "error" in pending.response:
+            err = pending.response["error"]
+            raise MCPError(
+                int(err.get("code", 0)),
+                str(err.get("message", "")) or "unknown error",
+                err.get("data"),
+            )
+        return pending.response.get("result") or {}
+
+    async def _notify(self, method: str, params: dict[str, Any]) -> None:
+        """Fire-and-forget JSON-RPC notification (no ``id``)."""
+
+        await self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    async def _send(self, message: dict[str, Any]) -> None:
+        if self._transport is None:
+            raise TransportClosed("MCP transport not open")
+        await self._transport.send(message)
+
+    async def _read_loop(self) -> None:
+        assert self._transport is not None
+        try:
+            while True:
+                try:
+                    message = await self._transport.receive()
+                except TransportClosed:
+                    break
+                self._dispatch(message)
+        finally:
+            # Unblock any pending requests on shutdown.
+            for pending in list(self._pending.values()):
+                if not pending.event.is_set():
+                    pending.error = TransportClosed("MCP transport closed")
+                    pending.event.set()
+
+    def _dispatch(self, message: dict[str, Any]) -> None:
+        if not isinstance(message, dict):
+            return
+        mid = message.get("id")
+        if mid is not None and "method" not in message:
+            # Response to one of our requests.
+            try:
+                key = int(mid)
+            except (TypeError, ValueError):
+                return
+            pending = self._pending.get(key)
+            if pending is None:
+                return
+            pending.response = message
+            pending.event.set()
+            return
+        # Server-initiated notification or request. v0: log+ignore.
+        # (Future work: hook progress + log message notifications into
+        # the agent's hook system; respond to sampling/elicitation
+        # round-trips here rather than only via tools/call error code.)
+
+
+# ---------------------------------------------------------------------------
+# Pending-request bookkeeping
+# ---------------------------------------------------------------------------
+
+
+class _PendingRequest:
+    __slots__ = ("event", "response", "error")
+
+    def __init__(self) -> None:
+        self.event = anyio.Event()
+        self.response: dict[str, Any] | None = None
+        self.error: BaseException | None = None
+
+
+# ---------------------------------------------------------------------------
+# Transport factory
+# ---------------------------------------------------------------------------
+
+
+async def _open_transport(config: ServerConfig) -> Transport:
+    if isinstance(config, StdioServerConfig):
+        t: Transport = StdioTransport(config.command, config.args, config.env)
+    elif isinstance(config, SseServerConfig):
+        t = SseTransport(config.url, config.headers)
+    elif isinstance(config, HttpServerConfig):
+        t = HttpTransport(config.url, config.headers)
+    elif isinstance(config, SdkServerConfig):
+        if config.server is None:
+            raise ValueError(
+                "SdkServerConfig must carry an SdkServer; use create_sdk_server()"
+            )
+        t = InProcessTransport(config.server)
+    else:
+        raise TypeError(f"unknown server config: {type(config).__name__}")
+    await t.__aenter__()
+    return t
+
+
+def _derive_server_id(config: ServerConfig) -> str:
+    if isinstance(config, StdioServerConfig):
+        return f"stdio:{config.command}"
+    if isinstance(config, SseServerConfig):
+        return f"sse:{config.url}"
+    if isinstance(config, HttpServerConfig):
+        return f"http:{config.url}"
+    if isinstance(config, SdkServerConfig):
+        return f"sdk:{config.name}"
+    return "mcp:unknown"

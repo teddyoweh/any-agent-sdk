@@ -1,36 +1,47 @@
 """Agent — the run loop.
 
-This is the only place that knows about *both* providers and tools. It owns
-the multi-turn dance:
+This module owns the multi-turn dance:
 
-    1. Send messages → provider.stream
-    2. Assemble assistant message from event stream
-    3. If assistant requested tools → dispatch → append results → loop
-    4. Else → return final assistant message (or raise on hard stop)
+  1. Send messages → provider.stream (model + backend resolved from capability)
+  2. Drive a StreamingToolExecutor on the event stream: tool calls dispatch
+     as soon as their input JSON closes, not after the assistant finalizes.
+  3. Run hooks (PreToolUse, PostToolUse, Stop) at the right moments.
+  4. Check permissions before each tool call.
+  5. Track budget (turns + USD + tokens) and raise BudgetExceededError when hit.
+  6. If the assistant emits tool calls, append results + loop; otherwise stop.
 
 The streaming variant (``Agent.stream``) yields the *normalized* event
 stream so user UIs can render token-by-token. The non-streaming
 ``Agent.run`` consumes the stream internally and returns the final messages.
 
+The agent is *backend-agnostic* — model + backend URL drive provider choice
+via ``capabilities.lookup_model`` + ``providers.base.detect_provider``. Pass
+``provider=`` directly to override.
+
 Performance notes
 -----------------
-* Text deltas are *not* concatenated until the block stops. We hold them in
-  a list and ``"".join`` once at ContentBlockStop — that's O(n) once instead
-  of O(n²) per delta.
-* Tool input JSON deltas are likewise buffered as strings and parsed once
-  at block stop.
-* We never deep-copy messages; the conversation list is appended-to in place.
+* Text deltas are *not* concatenated until the block stops (O(n) join once).
+* Tool input JSON deltas are buffered and parsed once at block stop.
+* Conversation list is appended-to in place, never copied.
+* Capability lookups are O(1) and frozen onto the agent at init.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
 import msgspec
 
+from .capabilities import (
+    BackendCapability,
+    ModelCapability,
+    hosted_profile_from_url,
+    lookup_model,
+)
 from .errors import StreamProtocolError
 from .events import (
     ContentBlockDelta,
@@ -70,24 +81,94 @@ _JSON_DECODER = msgspec.json.Decoder()
 
 @dataclass(slots=True)
 class Agent:
-    """Multi-turn agent over any registered provider.
+    """Multi-turn agent over any OSS model on any compatible backend.
 
-    Construct with a model name; the provider is auto-detected. Pass an
-    explicit ``provider=`` instance for full control.
+    Construction
+    ------------
+    The minimal form is ``Agent(model="qwen2.5-72b-instruct")`` — but most
+    users will also pass ``backend="http://localhost:11434"`` (Ollama),
+    ``"https://api.together.xyz/v1"`` (Together), etc.
+
+    ``provider`` overrides the auto-construction completely. Useful for
+    tests (pass a ``MockProvider``) or exotic deployments.
+
+    ``model_capability`` overrides the looked-up capability — useful when
+    you know your custom-finetuned model supports tool calling but the
+    family heuristic doesn't.
     """
 
     model: str
+    backend: str | None = None
     provider: Provider | None = None
     system: str | None = None
-    tools: ToolRegistry = field(default_factory=ToolRegistry)
+    tools: ToolRegistry | list = field(default_factory=ToolRegistry)
     max_tokens: int = 1024
     temperature: float | None = None
     max_steps: int = 20
+    max_turns: int | None = None  # alias for max_steps
     extra: dict[str, Any] | None = None
 
+    # Capability + safety surface (M0.1 / M2)
+    model_capability: ModelCapability | None = None
+    backend_capability: BackendCapability | None = None
+
     def __post_init__(self) -> None:
+        # Normalize tools input — accept list[Tool] or pre-built ToolRegistry.
+        if not isinstance(self.tools, ToolRegistry):
+            registry = ToolRegistry()
+            if self.tools:
+                registry.add(*self.tools)
+            self.tools = registry
+
+        # max_turns is a friendly alias for max_steps (Claude SDK parity).
+        if self.max_turns is not None:
+            self.max_steps = self.max_turns
+
+        # Resolve model capability if not given explicitly.
+        if self.model_capability is None:
+            self.model_capability = lookup_model(self.model)
+
+        # Resolve backend capability if not given explicitly.
+        if self.backend_capability is None and self.backend:
+            self.backend_capability = hosted_profile_from_url(self.backend)
+
+        # Build the provider if not given.
         if self.provider is None:
-            self.provider = resolve(detect_provider(self.model))()
+            backend_str = self.backend or self.model
+            backend_kind = detect_provider(backend_str)
+            ProviderCls = resolve(backend_kind)
+            self.provider = self._build_provider(ProviderCls, backend_kind)
+
+        # Propagate temperature from capability if user didn't set one.
+        if self.temperature is None:
+            self.temperature = self.model_capability.recommended_temperature
+
+    def _build_provider(self, ProviderCls: type[Provider], backend_kind: str) -> Provider:
+        """Construct a provider with sensible defaults per backend kind."""
+
+        kw: dict[str, Any] = {}
+        if backend_kind == "openai_compat":
+            kw["base_url"] = self.backend or os.environ.get(
+                "ANY_AGENT_BASE_URL", "http://localhost:8000/v1"
+            )
+            kw["api_key"] = os.environ.get("ANY_AGENT_API_KEY")
+            if self.backend_capability is not None:
+                kw["backend_capability"] = self.backend_capability
+        elif backend_kind == "ollama":
+            kw["base_url"] = self.backend or "http://localhost:11434"
+        elif backend_kind == "llamacpp":
+            kw["base_url"] = self.backend or "http://localhost:8080"
+        elif backend_kind == "tgi":
+            kw["base_url"] = self.backend or "http://localhost:3000/v1"
+        elif backend_kind == "mock":
+            pass  # mock takes its own kwargs from `extra`
+        # Best-effort construction — adapters that don't accept some keys
+        # will tell us at instantiation.
+        try:
+            return ProviderCls(**kw)
+        except TypeError:
+            # Fall back to no-kwarg construction.
+            return ProviderCls()  # type: ignore[call-arg]
 
     # ------------------------------------------------------------------
     # Public API
@@ -127,6 +208,13 @@ class Agent:
         if self.provider is not None:
             await self.provider.aclose()
 
+    # Async context manager sugar — `async with Agent(...) as a: ...`
+    async def __aenter__(self) -> Agent:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.aclose()
+
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
@@ -140,25 +228,32 @@ class Agent:
         return assembler.finalize()
 
     def _provider_stream(self, messages: list[Message]) -> AsyncIterator[StreamEvent]:
-        # Hoist out the system message if it's the first element, since
-        # providers want it as a top-level field. (UserMessage with a
-        # system role is unusual; we just pass everything through and let
-        # the adapter sort it.)
+        # Hoist the system prompt: prefer explicit Agent.system, else look at
+        # messages[0] if it's a SystemMessage. Provider adapters expect system
+        # as a top-level field (Anthropic, OpenAI, Ollama all do).
         system = self.system
         if system is None and messages and isinstance(messages[0], SystemMessage):
             sys_msg = messages[0]
             system = sys_msg.content if isinstance(sys_msg.content, str) else None
 
         assert self.provider is not None  # post-init guarantees this
-        return self.provider.stream(
-            model=self.model,
-            messages=messages,
-            system=system,
-            tools=self.tools.to_wire() if self.tools else None,
-            max_tokens=self.max_tokens,
-            temperature=self.temperature,
-            extra=self.extra,
-        )
+
+        # Pass the resolved capability through so the provider can pick the
+        # right tool-use path (A/B/C) without re-doing lookup.
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "system": system,
+            "tools": self.tools.to_wire() if self.tools else None,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "extra": self.extra,
+        }
+        # Some legacy adapters don't accept model_capability; gate it.
+        try:
+            return self.provider.stream(model_capability=self.model_capability, **kwargs)
+        except TypeError:
+            return self.provider.stream(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +334,6 @@ class _AssistantAssembler:
             if ev.stop_reason is not None:
                 self.stop_reason = ev.stop_reason
             if ev.usage is not None:
-                # Merge — Anthropic emits partial usage updates.
                 self.usage = _merge_usage(self.usage, ev.usage)
             return
         if isinstance(ev, MessageStop):
@@ -303,9 +397,8 @@ class _AssistantAssembler:
 
 
 def _merge_usage(prev: Usage | None, new: Usage) -> Usage:
-    """Anthropic emits usage incrementally in message_delta. We add fields
-    that grow (output_tokens) and prefer the latest non-zero for the input
-    counters (which are typically set once on message_start)."""
+    """Merge incremental usage updates. Output tokens accumulate; input tokens
+    typically arrive once on message_start so we prefer the latest non-zero."""
 
     if prev is None:
         return new

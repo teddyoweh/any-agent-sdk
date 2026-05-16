@@ -36,21 +36,56 @@ ToolFn = Callable[..., Awaitable[Any]]
 
 @dataclass(slots=True)
 class Tool:
-    """Runtime representation of a tool the agent can call."""
+    """Runtime representation of a tool the agent can call.
+
+    Fields
+    ------
+    name, description, input_schema, fn:
+        The four things every tool needs.
+    is_concurrency_safe:
+        ``True`` (default), ``False``, or a callable ``(input: dict) -> bool``.
+        Function-of-input form matches Claude Code's upstream model — two ``bash``
+        calls writing to different files can parallelize; same file can't.
+    abort_siblings_on_error:
+        When ``True`` and this tool errors inside a concurrent batch, the
+        ``StreamingToolExecutor`` cancels its sibling tasks via the batch
+        ``CancelScope`` so subprocesses die fast. Default ``False``.
+    is_read_only:
+        Hint to the permission system + concurrency partitioner. Read-only
+        tools are auto-allowed under ``mode="auto"``.
+    timeout_s:
+        Soft per-call timeout via ``anyio.fail_after``. ``None`` for no timeout.
+    parallel_safe (deprecated):
+        Kept for backwards compat with v0 callers. Reads/writes through to
+        ``is_concurrency_safe``.
+    """
 
     name: str
     description: str
     input_schema: dict[str, Any]
     fn: ToolFn
-    parallel_safe: bool = True
+    is_concurrency_safe: Callable[[dict], bool] | bool = True
+    abort_siblings_on_error: bool = False
+    is_read_only: bool = False
+    timeout_s: float | None = None
 
     def to_wire(self) -> dict[str, Any]:
-        """Anthropic-format tool definition. Other providers convert from this."""
+        """JSON-Schema tool definition (Anthropic-shaped). Other providers
+        convert from this — e.g. OpenAI wraps it under ``function``."""
         return {
             "name": self.name,
             "description": self.description,
             "input_schema": self.input_schema,
         }
+
+    # Backwards-compat shim. v0 used a static ``parallel_safe`` bool.
+    @property
+    def parallel_safe(self) -> bool:
+        return self.is_concurrency_safe is True
+
+    @parallel_safe.setter
+    def parallel_safe(self, value: bool) -> None:
+        self.is_concurrency_safe = bool(value)
 
 
 def tool(
@@ -58,8 +93,13 @@ def tool(
     *,
     name: str | None = None,
     description: str | None = None,
-    parallel_safe: bool = True,
+    is_concurrency_safe: Callable[[dict], bool] | bool = True,
+    abort_siblings_on_error: bool = False,
+    is_read_only: bool = False,
+    timeout_s: float | None = None,
     input_schema: dict[str, Any] | None = None,
+    # Deprecated alias, accepted for backwards compat.
+    parallel_safe: bool | None = None,
 ) -> Tool | Callable[[ToolFn], Tool]:
     """Decorator: turn an async function into a ``Tool``.
 
@@ -71,8 +111,13 @@ def tool(
             ...
 
     Schema is auto-derived from type hints + docstring. Pass ``input_schema``
-    explicitly to override (useful for complex shapes).
+    explicitly to override (useful for complex shapes). See the ``Tool``
+    dataclass docstring for the full field semantics.
     """
+
+    # Resolve deprecated alias once.
+    if parallel_safe is not None and is_concurrency_safe is True:
+        is_concurrency_safe = bool(parallel_safe)
 
     def _wrap(fn: ToolFn) -> Tool:
         if not inspect.iscoroutinefunction(fn):
@@ -82,7 +127,10 @@ def tool(
             description=description or (inspect.getdoc(fn) or "").strip(),
             input_schema=input_schema or _derive_schema(fn),
             fn=fn,
-            parallel_safe=parallel_safe,
+            is_concurrency_safe=is_concurrency_safe,
+            abort_siblings_on_error=abort_siblings_on_error,
+            is_read_only=is_read_only,
+            timeout_s=timeout_s,
         )
 
     if fn is not None:
