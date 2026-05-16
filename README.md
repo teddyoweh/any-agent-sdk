@@ -67,6 +67,53 @@ Same script against Fireworks, vLLM, llama.cpp, Groq — just change `model`. Th
 
 ---
 
+## Custom backend — point at any OpenAI-compatible server
+
+Auto-routing covers the well-known providers from the model name. For everything else — your own vLLM on a private GPU box, LM Studio on a custom port, a corporate proxy, OpenRouter, Groq, an internal inference cluster — pass `backend=` explicitly. The URL wins over inference.
+
+```python
+# Self-hosted vLLM on a private GPU box
+options = ClaudeAgentOptions(
+    model="Qwen/Qwen2.5-72B-Instruct",
+    backend="https://gpu-box.internal:8000/v1",
+    api_key=os.environ["INTERNAL_KEY"],
+    tools=[get_weather],
+)
+
+# LM Studio on a non-standard port
+options = ClaudeAgentOptions(
+    model="qwen2.5:7b",
+    backend="http://localhost:1234/v1",
+    tools=[get_weather],
+)
+
+# Groq (blazing fast llama / mixtral)
+options = ClaudeAgentOptions(
+    model="llama-3.3-70b-versatile",
+    backend="https://api.groq.com/openai/v1",
+    api_key=os.environ["GROQ_API_KEY"],
+)
+
+# OpenRouter aggregator (200+ models behind one API)
+options = ClaudeAgentOptions(
+    model="anthropic/claude-3.5-sonnet",  # OpenRouter proxies even Anthropic
+    backend="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+)
+```
+
+Or set it once for the whole process via env:
+
+```bash
+export ANY_AGENT_BASE_URL=https://gpu-box.internal:8000/v1
+export ANY_AGENT_API_KEY=...
+python my_agent.py
+```
+
+Precedence: explicit `backend=` > `$ANY_AGENT_BASE_URL` > model-name inference > Ollama default.
+
+---
+
 ## Run locally on CPU (no GPU needed)
 
 The fastest path to a working agent: one command.
