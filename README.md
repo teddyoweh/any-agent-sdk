@@ -108,114 +108,69 @@ Precedence: explicit `backend=` > `$ANY_AGENT_BASE_URL` > model-name inference >
 
 ---
 
-## Run locally on CPU (no GPU needed)
+## Models — ranked, picked by where they run
 
-The fastest path to a working agent: one command.
+Ranked by current OSS leaderboards (Arena Elo · GPQA · SWE-bench, May 2026). Pick the highest-ranked model that fits your hardware.
+
+| # | Model                  | Runs                       | `model=`                                  | Notable                                             |
+|--:|------------------------|----------------------------|-------------------------------------------|-----------------------------------------------------|
+| 1 | **Kimi K2.6**          | cloud                      | `moonshotai/Kimi-K2.6-Instruct`           | #1 open-weights GPQA (90.5%)                        |
+| 2 | **Qwen3 235B-A22B**    | cloud · 64 GB+ local       | `Qwen/Qwen3-235B-A22B-Instruct-Turbo`     | Broadest benchmark leader · Apache 2.0              |
+| 3 | **GLM-5**              | cloud                      | `zai-org/GLM-5`                           | Best Arena Elo among open (1451)                    |
+| 4 | **MiniMax M2.5**       | cloud                      | `minimaxai/MiniMax-M2.5`                  | 80.2% SWE-bench · ties Claude Opus 4.6 on code      |
+| 5 | **DeepSeek-V3.2**      | cloud · 80 GB+ local       | `deepseek-ai/DeepSeek-V3.2`               | Top general-purpose OSS                             |
+| 6 | **Llama 4 Maverick**   | cloud · 72 GB local        | `meta-llama/Llama-4-Maverick-17B-128E`    | Meta's flagship 2025 MoE                            |
+| 7 | **gpt-oss-120b**       | cloud · 80 GB local        | `gpt-oss:120b`                            | OpenAI's open release · ~o4-mini class              |
+| 8 | **DeepSeek-R1**        | cloud · 48 GB+ local       | `deepseek-r1:70b` / `deepseek-ai/...`     | Reasoning · emits `<think>` blocks                  |
+| 9 | **Llama 4 Scout**      | 24 GB local · cloud        | `llama4:scout`                            | 10M context window · fits a 24 GB GPU               |
+| 10 | **Hermes 4 70B**      | 48 GB local · cloud        | `hermes4:70b`                             | Nous — tool-use + reasoning tuned                   |
+| 11 | **DeepSeek-R1 32B**   | 24 GB local                | `deepseek-r1:32b`                         | Reasoning, fits a big-laptop GPU                    |
+| 12 | **Qwen3 32B**         | 24 GB local                | `qwen3:32b`                               | Strong general-purpose                              |
+| 13 | **Llama 3.3 70B**     | 48 GB local · cloud        | `llama3.3:70b`                            | Stable, well-supported                              |
+| 14 | **gpt-oss-20b**       | 16 GB local                | `gpt-oss:20b`                             | OpenAI open · runs on a laptop                      |
+| 15 | **Phi 4 medium**      | 16 GB local                | `phi4:medium`                             | MS — strong reasoning for size                      |
+| 16 | **Gemma 3 27B**       | 16 GB local                | `gemma3:27b`                              | Google's latest                                     |
+| 17 | **Qwen3 14B / 8B**    | 8–12 GB local              | `qwen3:14b` / `qwen3:8b`                  | Mid-tier all-rounder                                |
+| 18 | **Llama 3.1 8B**      | 8 GB local                 | `llama3.1:8b`                             | Mainstream baseline                                 |
+| 19 | **Phi 4 small**       | 8 GB local                 | `phi4:small`                              | Compact reasoning                                   |
+| 20 | **DeepSeek-R1 8B/14B**| 8–12 GB local              | `deepseek-r1:8b` / `:14b`                 | Reasoning on a mainstream laptop                    |
+
+**CPU-laptop tier** (no GPU, ≤ 8 GB RAM) — `any-agent setup-local` picks from this list:
+
+| # | Tag                  | Params | RAM   | Tools | Reasoning | Notes                              |
+|--:|----------------------|-------:|------:|:-----:|:---------:|------------------------------------|
+| C1 | `qwen2.5:1.5b`       | 1.5B   | 4 GB  | yes   | no        | **Default** — best 1.5B for agents |
+| C2 | `deepseek-r1:1.5b`   | 1.5B   | 4 GB  | yes   | yes       | Reasoning, emits `<think>`         |
+| C3 | `llama3.2:3b`        | 3.2B   | 6 GB  | yes   | no        | Best 3B for 8 GB laptops           |
+| C4 | `qwen2.5:3b`         | 3B     | 6 GB  | yes   | no        | Same class as Llama 3.2 3B         |
+| C5 | `phi3.5:3.8b`        | 3.8B   | 6 GB  | yes   | no        | Punches above its weight           |
+| C6 | `llama3.2:1b`        | 1.2B   | 4 GB  | yes   | no        | Sharper than 0.5B Qwen             |
+| C7 | `qwen2.5:0.5b`       | 0.5B   | 2 GB  | yes   | no        | Smallest with tool calls           |
+| C8 | `gemma2:2b`          | 2B     | 4 GB  | no    | no        | Chat only, polished prose          |
+| C9 | `tinyllama:1.1b`     | 1.1B   | 2 GB  | no    | no        | RAM-constrained pick               |
+| C10 | `smollm2:135m`      | 135M   | 2 GB  | no    | no        | Tiny — sanity-check install        |
 
 ```bash
-any-agent setup-local
+any-agent setup-local           # one command — installs Ollama if missing, pulls C1, smoke tests
+any-agent setup-local --list    # see the catalog
+any-agent setup-local --model qwen2.5:3b
 ```
 
-What it does: checks for Ollama, installs it if missing (Linux/macOS), pulls a curated CPU-friendly model (default `qwen2.5:1.5b`), and runs a smoke-test request. Pass `--list` to see the catalog, `--model qwen2.5:3b` to pick a different one, `--install-ollama` to auto-install Ollama.
+### How to actually call them
 
-The curated catalog — every entry runs on CPU without a discrete GPU:
+Auto-routing reads the model name shape (see `any_agent_sdk/routing.py`):
 
-| Tag                  | Params | Size  | RAM   | Tool calls | Reasoning | Notes                                              |
-|----------------------|-------:|------:|------:|:----------:|:---------:|----------------------------------------------------|
-| `smollm2:135m`       | 135M   | 0.3GB | 2 GB+ | no         | no        | Tiny — sanity-check install                        |
-| `qwen2.5:0.5b`       | 0.5B   | 0.4GB | 2 GB+ | yes        | no        | Smallest Qwen with tool calls. Fast on anything.   |
-| `tinyllama:1.1b`     | 1.1B   | 0.6GB | 2 GB+ | no         | no        | RAM-constrained pick                               |
-| `qwen2.5:1.5b`       | 1.5B   | 1.0GB | 4 GB+ | yes        | no        | **Default** — best 1.5B for agent loops            |
-| `deepseek-r1:1.5b`   | 1.5B   | 1.1GB | 4 GB+ | yes        | yes       | Emits `<think>` blocks; we parse them              |
-| `llama3.2:1b`        | 1.2B   | 1.3GB | 4 GB+ | yes        | no        | Meta's 1B — sharper than 0.5B Qwen                 |
-| `gemma2:2b`          | 2B     | 1.6GB | 4 GB+ | no         | no        | Google's 2B — polished prose, no tools             |
-| `qwen2.5:3b`         | 3B     | 1.9GB | 6 GB+ | yes        | no        | Same class as Llama 3.2 3B                         |
-| `llama3.2:3b`        | 3.2B   | 2.0GB | 6 GB+ | yes        | no        | Solid default if you have 8 GB RAM                 |
-| `phi3.5:3.8b`        | 3.8B   | 2.2GB | 6 GB+ | yes        | no        | Strong reasoning for size                          |
-| `qwen2.5:7b`         | 7B     | 4.7GB | 8 GB+ | yes        | no        | CPU ceiling — slow without M-series / GPU          |
-| `llama3.1:8b`        | 8B     | 4.9GB | 8 GB+ | yes        | no        | Edge of CPU usability                              |
+| Shape                                      | Backend it routes to                          | Env to set                                  |
+|--------------------------------------------|-----------------------------------------------|---------------------------------------------|
+| `name:tag` (e.g. `qwen3:8b`)               | Ollama (`http://localhost:11434`)             | —                                           |
+| `org/repo` (e.g. `Qwen/Qwen3-235B-...`)    | Together AI                                   | `TOGETHER_API_KEY`                          |
+| `accounts/fireworks/models/...`            | Fireworks AI                                  | `FIREWORKS_API_KEY`                         |
+| `gpt-*`, `o1-*`, `o3-*`, `o4-*`            | OpenAI native                                 | `OPENAI_API_KEY`                            |
+| `gemini-*`                                 | Google Gen-Lang (OpenAI-compat)               | `GEMINI_API_KEY`                            |
+| `claude-*`                                 | refused — use the real `claude-agent-sdk`     | —                                           |
+| anything else                              | Ollama default                                | —                                           |
 
-Run any of them by tag — auto-routing sends them to local Ollama:
-
-```python
-options = ClaudeAgentOptions(model="qwen2.5:1.5b", tools=[...])
-options = ClaudeAgentOptions(model="deepseek-r1:1.5b", tools=[...])   # gets <think> support free
-```
-
----
-
-## Supported models — full catalog
-
-Auto-routing recognizes these shapes (see `any_agent_sdk/routing.py`). Pass `backend=` to override.
-
-### 🏠 Local — runs on your machine
-
-**Ollama** — tag form like `qwen3:8b`, `deepseek-r1:1.5b`, `gpt-oss:20b`. Auto-routed to `http://localhost:11434`. No API key, no network egress. CPU works for the small end; GPU / Apple Silicon for the larger ones.
-
-Frontier open-weight models that actually run locally:
-
-| Model                          | Tag                          | Min RAM | Notes                                                                 |
-|--------------------------------|------------------------------|--------:|-----------------------------------------------------------------------|
-| **OpenAI gpt-oss 20B**         | `gpt-oss:20b`                | 16 GB   | OpenAI's open-weight, MXFP4 native. Roughly o3-mini class.            |
-| **DeepSeek-R1 distill (1.5B–70B)** | `deepseek-r1:1.5b` … `:70b` | 4–48 GB | Reasoning model, emits `<think>` blocks — we parse them.              |
-| **Qwen3 (0.6B–32B)**           | `qwen3:0.6b` … `qwen3:32b`   | 2–24 GB | Strong all-rounder, tool use solid even at 8B.                        |
-| **Qwen3 235B-A22B (MoE)**      | `qwen3:235b-a22b`            | 64+ GB  | Top OSS on broad benchmarks; only viable on big rigs locally.         |
-| **Llama 4 Scout / Maverick**   | `llama4:scout`, `llama4:maverick` | 24/72 GB | Meta's 2025 line — long-context Scout fits a 24 GB GPU.       |
-| **Llama 3.1/3.2/3.3 (1B–70B)** | `llama3.2:1b` … `llama3.3:70b` | 4–48 GB | Stable, well-supported, native tool calls.                          |
-| **Mistral / Mixtral / Magistral** | `mistral:7b`, `mixtral:8x7b`, `magistral:24b` | 6–48 GB | Mixtral MoE, Magistral reasoning. |
-| **Phi 4 mini / small / medium** | `phi4:mini` / `:small` / `:medium` | 6–24 GB | MS Phi-4 — punches above its weight on reasoning.                |
-| **Gemma 3 (2B–27B)**           | `gemma3:2b` … `gemma3:27b`   | 4–24 GB | Google's latest. 27B variant has strong agentic perf.                 |
-| **Hermes 4 (8B–70B)**          | `hermes4:8b` … `hermes4:70b` | 8–48 GB | Nous Research — tool use + reasoning emphasis.                        |
-| **GLM-4.6 / GLM-5 (smaller)**  | `glm4.6:9b`, `glm5:32b`      | 8–24 GB | THUDM — strong agentic perf, smaller variants run locally.            |
-| **DeepSeek-V3 / V3.2 distills**| `deepseek-v3:7b` etc.        | 6+ GB   | Distilled coding-focused variants.                                    |
-| **TinyLlama, SmolLM2, OLMo, Granite, Yi, command-r** | various          | 1–24 GB | The long tail — see `any-agent setup-local --list`.        |
-
-Run `any-agent setup-local` to get a CPU-runnable model in two minutes. See the **Run locally on CPU** section above for the curated catalog of CPU-friendly picks.
-
-**Self-hosted (your own GPU / cluster)** — point `backend=` at any vLLM, llama.cpp (with `--jinja`), TGI, or LM Studio. Useful for running gpt-oss-120b, Qwen3 235B, Kimi K2, Llama 4 Maverick, or anything else too big for a laptop.
-
-### ☁️ Cloud — hosted APIs
-
-**Together AI** — HuggingFace `org/repo` shape, auto-routed. Needs `$TOGETHER_API_KEY`. The widest OSS catalog: Qwen3, Llama 4, DeepSeek-V3/R1, Mixtral, Gemma 3, gpt-oss-120b, Kimi-K2 family.
-
-```python
-model="Qwen/Qwen3-235B-A22B-Instruct-Turbo"
-model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
-model="deepseek-ai/DeepSeek-V3.2"
-```
-
-**Fireworks AI** — path form `accounts/fireworks/models/<id>`, auto-routed. Needs `$FIREWORKS_API_KEY`. Strong for low-latency Llama 4, DeepSeek-R1, gpt-oss-120b, Qwen3.
-
-**OpenRouter (aggregator)** — set `backend=https://openrouter.ai/api/v1` + `$OPENROUTER_API_KEY`. 300+ models behind one API: Kimi K2.6, Qwen3, DeepSeek, GLM-5, MiniMax M2.5, Hermes 4, gpt-oss, anything you can name.
-
-**Groq (lowest latency)** — set `backend=https://api.groq.com/openai/v1` + `$GROQ_API_KEY`. Llama 3.3/4, Mixtral, DeepSeek-R1-distill, Gemma 3, gpt-oss-20b. Ridiculously fast.
-
-**Moonshot (Kimi)** — set `backend=https://api.moonshot.cn/v1` + `$MOONSHOT_API_KEY`. Kimi K2 / K2.6 — currently #1 on several OSS leaderboards (90.5% GPQA).
-
-**DeepSeek native** — set `backend=https://api.deepseek.com/v1` + `$DEEPSEEK_API_KEY`. DeepSeek-V3.2, DeepSeek-R1 from the source.
-
-**Cerebras / DeepInfra / Anyscale** — same pattern, set `backend=` + the respective key.
-
-**Frontier OSS shortlist (May 2026 leaderboards)**
-
-| Model                  | Where to get it             | Notable                                             |
-|------------------------|-----------------------------|-----------------------------------------------------|
-| **Kimi K2.6**          | Moonshot, OpenRouter        | #1 open-weights on GPQA (90.5%)                     |
-| **Qwen3 235B-A22B**    | Together, Fireworks, local  | Broadest benchmark leader, Apache 2.0               |
-| **GLM-5**              | OpenRouter, Z.ai            | Best Arena Elo among open models (1451)             |
-| **MiniMax M2.5**       | OpenRouter, MiniMax         | 80.2% SWE-bench, ties Claude Opus 4.6 on coding     |
-| **DeepSeek-R1**        | DeepSeek, Together, local   | Reasoning specialist (emits `<think>`)              |
-| **DeepSeek-V3.2**      | DeepSeek, Together          | Top general-purpose OSS                             |
-| **Llama 4 Scout**      | Together, Fireworks, local  | 10M context window, fits 24 GB GPU                  |
-| **gpt-oss-120b**       | OpenAI weights → any host   | OpenAI's open release, ~o4-mini class               |
-| **gpt-oss-20b**        | Ollama (local!), any host   | Runs on 16 GB locally                               |
-| **Hermes 4 70B**       | OpenRouter, Together, local | Nous — tool-use + reasoning tuned                   |
-
-### Proprietary
-
-**OpenAI native** — `gpt-4o`, `gpt-5`, `o1`, `o3-mini`, `o4-mini`. Auto-routed.
-**Gemini** — `gemini-2.0-flash`, `gemini-1.5-pro`. Auto-routed.
-**Claude** — explicitly refused. Use the real `claude-agent-sdk` for Anthropic models.
+For Groq, Moonshot (Kimi native), DeepSeek native, OpenRouter, Cerebras, DeepInfra, Anyscale, LM Studio, self-hosted vLLM / llama.cpp / TGI — pass `backend=` explicitly or set `ANY_AGENT_BASE_URL` (see **Custom backend** above). The pattern is the same: it's an OpenAI-compatible URL plus an API key.
 
 ---
 
