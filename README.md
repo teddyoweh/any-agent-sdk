@@ -257,7 +257,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] sse transport
 - [x] http transport
 - [x] Elicitation (server prompts user mid-session)
-- [ ] Sampling (server calls back into the agent's model)
+- [x] Sampling (server calls back into the agent's model)
 
 **Sessions + state**
 - [x] JSONL transcript persistence

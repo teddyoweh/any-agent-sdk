@@ -51,6 +51,8 @@ from ..tools import Tool, ToolRegistry, _stringify_result
 from .types import (
     ElicitationRequest,
     ElicitationResult,
+    SamplingMessage,
+    SamplingResult,
     SdkServerConfig,
 )
 
@@ -65,6 +67,16 @@ class ElicitationNotSupportedError(AgentError):
     back without ``capabilities.elicitation``. Tool authors should either
     handle this and fall back to a deterministic default, or document
     elicitation as a hard requirement.
+    """
+
+
+class SamplingNotSupportedError(AgentError):
+    """The connected client did not advertise the ``sampling`` capability.
+
+    Raised when a tool calls ``ctx.sample(...)`` but the handshake came
+    back without ``capabilities.sampling``. Tool authors that need to
+    call back into the agent's model must either handle this and fall
+    back, or document sampling as a hard requirement.
     """
 
 
@@ -135,6 +147,86 @@ class ServerContext:
             outbox=self._outbox,
             message=message,
             requested_schema=requested_schema or {},
+            timeout_s=timeout_s,
+        )
+
+    async def sample(
+        self,
+        messages: list[SamplingMessage] | list[dict[str, Any]],
+        *,
+        max_tokens: int = 1024,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        stop_sequences: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        model_preferences: dict[str, Any] | None = None,
+        include_context: str | None = None,
+        timeout_s: float | None = None,
+    ) -> SamplingResult:
+        """Ask the client to run an LLM call on this server's behalf.
+
+        Sends a ``sampling/createMessage`` request and awaits the
+        client's reply. The client typically routes the call through
+        the agent's own provider — that's the whole point of sampling:
+        servers borrow the agent's model instead of carrying their own
+        API keys.
+
+        ``messages`` accepts either a list of :class:`SamplingMessage`
+        or a list of dicts (``{"role": ..., "content": ...}``) for
+        convenience — the dict form is what most tool authors will
+        write inline.
+
+        Returns a :class:`SamplingResult` whose ``content`` field holds
+        the assistant's reply (typically ``{"type": "text", "text":
+        "..."}``).
+
+        Raises:
+            SamplingNotSupportedError: client never advertised the
+                capability — calling ``sample`` would deadlock.
+            TimeoutError: ``timeout_s`` elapsed before the client replied.
+                The server sends ``notifications/cancelled`` on the way
+                out so polite clients can abort their model call.
+        """
+
+        if "sampling" not in self._server.client_capabilities:
+            raise SamplingNotSupportedError(
+                "connected MCP client did not advertise the 'sampling' "
+                "capability — cannot call the agent's model"
+            )
+        # Normalize dict-form messages into SamplingMessage so the wire
+        # encoder doesn't have to branch.
+        normalized: list[SamplingMessage] = []
+        for m in messages:
+            if isinstance(m, SamplingMessage):
+                normalized.append(m)
+            elif isinstance(m, dict):
+                content = m.get("content")
+                if not isinstance(content, dict):
+                    raise ValueError(
+                        f"sampling message content must be a dict, got "
+                        f"{type(content).__name__}"
+                    )
+                normalized.append(
+                    SamplingMessage(
+                        role=str(m.get("role") or "user"),
+                        content=content,
+                    )
+                )
+            else:
+                raise TypeError(
+                    f"sampling messages must be SamplingMessage or dict, "
+                    f"got {type(m).__name__}"
+                )
+        return await self._server.send_sampling(
+            outbox=self._outbox,
+            messages=normalized,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            stop_sequences=stop_sequences,
+            metadata=metadata,
+            model_preferences=model_preferences,
+            include_context=include_context,
             timeout_s=timeout_s,
         )
 
@@ -391,6 +483,105 @@ class SdkServer:
         if not isinstance(content, dict):
             content = {}
         return ElicitationResult(action=action, content=content)
+
+    async def send_sampling(
+        self,
+        outbox: anyio.streams.memory.MemoryObjectSendStream[dict[str, Any]],
+        messages: list[SamplingMessage],
+        *,
+        max_tokens: int,
+        system_prompt: str | None,
+        temperature: float | None,
+        stop_sequences: list[str] | None,
+        metadata: dict[str, Any] | None,
+        model_preferences: dict[str, Any] | None,
+        include_context: str | None,
+        timeout_s: float | None = None,
+    ) -> SamplingResult:
+        """Send ``sampling/createMessage`` and wait for the client's reply.
+
+        Internal: tool authors call this through ``ServerContext.sample``.
+        Mirrors :meth:`send_elicitation` for ergonomics — same pending-
+        request registry, same timeout+cancel-notice path.
+        """
+
+        rid = next(self._id_counter)
+        pending = _PendingServerRequest()
+        self._pending_server_requests[rid] = pending
+
+        params: dict[str, Any] = {
+            "messages": [
+                {"role": m.role, "content": m.content} for m in messages
+            ],
+            "maxTokens": int(max_tokens),
+        }
+        if system_prompt is not None:
+            params["systemPrompt"] = system_prompt
+        if temperature is not None:
+            params["temperature"] = float(temperature)
+        if stop_sequences:
+            params["stopSequences"] = list(stop_sequences)
+        if metadata:
+            params["metadata"] = dict(metadata)
+        if model_preferences:
+            params["modelPreferences"] = dict(model_preferences)
+        if include_context is not None:
+            params["includeContext"] = include_context
+
+        request = {
+            "jsonrpc": "2.0",
+            "id": rid,
+            "method": "sampling/createMessage",
+            "params": params,
+        }
+        try:
+            await outbox.send(request)
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError) as exc:
+            self._pending_server_requests.pop(rid, None)
+            raise ConnectionError("MCP transport closed before sampling send") from exc
+
+        try:
+            if timeout_s is None:
+                await pending.event.wait()
+            else:
+                with anyio.fail_after(timeout_s):
+                    await pending.event.wait()
+        except TimeoutError:
+            self._pending_server_requests.pop(rid, None)
+            try:
+                await outbox.send(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "notifications/cancelled",
+                        "params": {"requestId": rid, "reason": "server timeout"},
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
+        self._pending_server_requests.pop(rid, None)
+        if pending.error is not None:
+            raise pending.error
+        response = pending.response or {}
+        if "error" in response:
+            err = response["error"]
+            raise AgentError(
+                f"sampling/createMessage error {err.get('code')}: "
+                f"{err.get('message', '')}"
+            )
+        result = response.get("result") or {}
+        # Be lenient on slightly off shapes — clients in the wild are
+        # imperfect; we'd rather surface what we got than crash.
+        content = result.get("content") if isinstance(result, dict) else None
+        if not isinstance(content, dict):
+            content = {}
+        return SamplingResult(
+            role=str(result.get("role") or "assistant"),
+            content=content,
+            model=str(result.get("model") or ""),
+            stop_reason=result.get("stopReason"),
+        )
 
     def _route_server_response(self, message: dict[str, Any]) -> None:
         """Match an inbound response to one of our server-initiated requests."""

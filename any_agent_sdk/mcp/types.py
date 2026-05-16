@@ -255,3 +255,101 @@ class ElicitationResult(msgspec.Struct, omit_defaults=True):
 # request to the user (CLI prompt, GUI dialog, web form, …) and returns
 # the answer.
 ElicitationHandler = Callable[[ElicitationRequest], Awaitable[ElicitationResult]]
+
+
+# ---------------------------------------------------------------------------
+# Sampling — server asks the client to run an LLM call on its behalf
+# ---------------------------------------------------------------------------
+#
+# This is the second server→client request shape in MCP, alongside
+# elicitation. A server that needs a model in its tool path (summarise
+# a doc, classify an email, decide what to do next) sends
+# ``sampling/createMessage`` instead of carrying its own API keys. The
+# client routes the request to whichever model the agent is currently
+# using and ships the assistant reply back. Handlers are free to pick a
+# different model — ``model_preferences`` is a hint, not a constraint.
+#
+# Shape mirrors the MCP ``sampling/createMessage`` params with camelCase
+# translated to snake_case. ``raw`` preserves the verbatim params dict so
+# handlers can inspect fields we haven't yet surfaced as attributes
+# (sampling is the part of the MCP spec most likely to add new options).
+
+
+class SamplingMessage(msgspec.Struct, omit_defaults=True):
+    """One message in a :class:`SamplingRequest` conversation.
+
+    ``role`` is either ``"user"`` or ``"assistant"``. ``content`` is the
+    MCP content-block dict — typically ``{"type": "text", "text": "..."}``
+    but the spec also allows ``image`` and ``audio`` blocks; the raw
+    dict is preserved so handlers can branch on ``content["type"]``.
+    """
+
+    role: str
+    content: dict[str, Any]
+
+
+class SamplingRequest(msgspec.Struct, omit_defaults=True):
+    """Server is asking the client to run an LLM call on its behalf.
+
+    Required:
+      * ``messages`` — the chat transcript to send to the model. At
+        least one entry; the *last* one is the prompt to respond to.
+      * ``max_tokens`` — required by the spec. Default 1024 if the
+        server omits it (some legacy servers do).
+
+    Optional hints from the server:
+      * ``system_prompt`` — system message to prepend.
+      * ``temperature`` — sampling temperature; ``None`` = handler picks.
+      * ``stop_sequences`` — additional stop strings.
+      * ``metadata`` — opaque server metadata (trace ids, etc.).
+      * ``model_preferences`` — speed/intelligence/cost hints + a list
+        of preferred model names. The handler is free to ignore.
+      * ``include_context`` — ``"none"`` | ``"thisServer"`` |
+        ``"allServers"``. When the client builds the message list it
+        can include context from MCP servers it's connected to.
+
+    ``raw`` is the verbatim params dict from the server — reach into
+    this for any field not yet typed.
+    """
+
+    messages: list[SamplingMessage]
+    max_tokens: int = 1024
+    system_prompt: str | None = None
+    temperature: float | None = None
+    stop_sequences: list[str] = []
+    metadata: dict[str, Any] = {}
+    model_preferences: dict[str, Any] = {}
+    include_context: str | None = None
+    raw: dict[str, Any] = {}
+
+
+class SamplingResult(msgspec.Struct, omit_defaults=True):
+    """Client's reply to a :class:`SamplingRequest`.
+
+    ``role`` must be ``"assistant"`` per the MCP spec; we normalize a
+    misconfigured ``"user"`` to ``"assistant"`` rather than crashing the
+    handler (wire correctness over Pythonic strictness).
+
+    ``content`` is the MCP content-block dict — typically
+    ``{"type": "text", "text": "<assistant reply>"}``. Pass through any
+    additional fields (``data`` for images, etc.) verbatim.
+
+    ``model`` MUST identify the model that produced the output; the
+    server uses it for audit logs and downstream prompt construction.
+    """
+
+    role: str = "assistant"
+    content: dict[str, Any] = {}
+    model: str = ""
+    stop_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.role != "assistant":
+            self.role = "assistant"
+
+
+# An async callback the MCPClient invokes when the server sends a
+# sampling/createMessage request. The handler runs the model call —
+# typically against the agent's own provider — and returns the
+# assistant reply.
+SamplingHandler = Callable[[SamplingRequest], Awaitable[SamplingResult]]

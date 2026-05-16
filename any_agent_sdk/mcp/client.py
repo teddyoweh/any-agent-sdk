@@ -59,6 +59,10 @@ from .types import (
     ElicitationResult,
     HttpServerConfig,
     MCPTool,
+    SamplingHandler,
+    SamplingMessage,
+    SamplingRequest,
+    SamplingResult,
     SdkServerConfig,
     ServerConfig,
     SseServerConfig,
@@ -144,6 +148,7 @@ class MCPClient:
         "server_info",
         "server_capabilities",
         "elicitation_handler",
+        "sampling_handler",
         "_transport",
         "_id_counter",
         "_pending",
@@ -158,6 +163,7 @@ class MCPClient:
         *,
         server_id: str | None = None,
         elicitation_handler: ElicitationHandler | None = None,
+        sampling_handler: SamplingHandler | None = None,
     ) -> None:
         self.config = config
         # Stable id used by MCPTool.server_id. Falls back to a synthetic
@@ -170,6 +176,11 @@ class MCPClient:
         # advertise the capability and will respond to such requests with
         # ``-32601 method not found``.
         self.elicitation_handler: ElicitationHandler | None = elicitation_handler
+        # Callback that produces a ``SamplingResult`` for an inbound
+        # ``sampling/createMessage`` request. Same advertise-only-if-
+        # registered rule as elicitation: a polite server won't ask
+        # unless we said we could answer.
+        self.sampling_handler: SamplingHandler | None = sampling_handler
         self._transport: Transport | None = None
         self._id_counter = itertools.count(1)
         self._pending: dict[int, _PendingRequest] = {}
@@ -316,9 +327,12 @@ class MCPClient:
         # only set when a handler is registered, otherwise a server that
         # honors our advertised capabilities and then sends us a prompt
         # would deadlock waiting for an answer we can't produce.
+        # ``sampling: {}`` follows the same advertise-iff-registered rule.
         capabilities: dict[str, Any] = {}
         if self.elicitation_handler is not None:
             capabilities["elicitation"] = {}
+        if self.sampling_handler is not None:
+            capabilities["sampling"] = {}
 
         result = await self._request(
             "initialize",
@@ -437,6 +451,8 @@ class MCPClient:
         try:
             if method == "elicitation/create":
                 await self._handle_elicitation(mid, params)
+            elif method == "sampling/createMessage":
+                await self._handle_sampling(mid, params)
             else:
                 await self._send(
                     {
@@ -513,6 +529,111 @@ class MCPClient:
                 "result": {"action": result.action, "content": result.content},
             }
         )
+
+    async def _handle_sampling(self, mid: Any, params: dict[str, Any]) -> None:
+        """Route a ``sampling/createMessage`` request to the client's handler.
+
+        Mirrors :meth:`_handle_elicitation` — if no handler is registered
+        we return ``-32601`` instead of hanging. We're defensive about
+        the params shape because sampling has the largest field set in
+        the MCP spec and servers in the wild get some of it wrong
+        (missing ``maxTokens``, integer ``temperature``, etc.).
+        """
+
+        if self.sampling_handler is None:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "error": {
+                        "code": -32601,
+                        "message": "client did not register a sampling_handler",
+                    },
+                }
+            )
+            return
+
+        # Parse messages. Malformed entries are skipped rather than
+        # crashing — the handler still sees the well-formed ones.
+        messages: list[SamplingMessage] = []
+        for raw_msg in params.get("messages") or []:
+            if not isinstance(raw_msg, dict):
+                continue
+            content = raw_msg.get("content")
+            if not isinstance(content, dict):
+                continue
+            messages.append(
+                SamplingMessage(
+                    role=str(raw_msg.get("role") or "user"),
+                    content=content,
+                )
+            )
+
+        try:
+            max_tokens = int(params.get("maxTokens") or 1024)
+        except (TypeError, ValueError):
+            max_tokens = 1024
+
+        # System prompt / temperature / stop_sequences are all optional;
+        # tolerate wrong types by coercing or skipping. This keeps the
+        # handler from seeing a half-broken request.
+        system_prompt = params.get("systemPrompt")
+        if not isinstance(system_prompt, str):
+            system_prompt = None
+
+        raw_temp = params.get("temperature")
+        if isinstance(raw_temp, (int, float)):
+            temperature: float | None = float(raw_temp)
+        else:
+            temperature = None
+
+        raw_stops = params.get("stopSequences")
+        stop_sequences = list(raw_stops) if isinstance(raw_stops, list) else []
+
+        raw_meta = params.get("metadata")
+        metadata = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+
+        raw_prefs = params.get("modelPreferences")
+        model_preferences = dict(raw_prefs) if isinstance(raw_prefs, dict) else {}
+
+        raw_ctx = params.get("includeContext")
+        include_context = raw_ctx if isinstance(raw_ctx, str) else None
+
+        request = SamplingRequest(
+            messages=messages,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            stop_sequences=stop_sequences,
+            metadata=metadata,
+            model_preferences=model_preferences,
+            include_context=include_context,
+            raw=dict(params),
+        )
+        result = await self.sampling_handler(request)
+        if not isinstance(result, SamplingResult):
+            # Lenient: accept a plain dict shaped like a result.
+            if isinstance(result, dict):
+                result = SamplingResult(
+                    role=str(result.get("role") or "assistant"),
+                    content=result.get("content") or {},
+                    model=str(result.get("model") or ""),
+                    stop_reason=result.get("stopReason"),
+                )
+            else:
+                raise TypeError(
+                    "sampling_handler must return SamplingResult, "
+                    f"got {type(result).__name__}"
+                )
+
+        wire: dict[str, Any] = {
+            "role": result.role,
+            "content": result.content,
+            "model": result.model,
+        }
+        if result.stop_reason is not None:
+            wire["stopReason"] = result.stop_reason
+        await self._send({"jsonrpc": "2.0", "id": mid, "result": wire})
 
 
 # ---------------------------------------------------------------------------
