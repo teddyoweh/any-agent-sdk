@@ -36,13 +36,14 @@ from typing import Any
 
 import msgspec
 
+from .budget import Budget, BudgetTracker
 from .capabilities import (
     BackendCapability,
     ModelCapability,
     hosted_profile_from_url,
     lookup_model,
 )
-from .errors import StreamProtocolError
+from .errors import BudgetExceededError, StreamProtocolError
 from .events import (
     ContentBlockDelta,
     ContentBlockStart,
@@ -56,8 +57,16 @@ from .events import (
     TextDelta,
     ThinkingDelta,
 )
+from .hooks import HookContext, HookDispatcher, Hooks
+from .permissions import (
+    Allow,
+    Deny,
+    PermissionContext,
+    check_permission,
+)
 from .providers.base import Provider, detect_provider, resolve
-from .tools import ToolRegistry, dispatch_tool_calls
+from .streaming.executor import StreamingToolExecutor
+from .tools import Tool, ToolRegistry, dispatch_tool_calls
 from .types import (
     AssistantMessage,
     ContentBlock,
@@ -65,6 +74,7 @@ from .types import (
     SystemMessage,
     TextBlock,
     ThinkingBlock,
+    ToolResultBlock,
     ToolUseBlock,
     UserMessage,
     Usage,
@@ -112,6 +122,17 @@ class Agent:
     model_capability: ModelCapability | None = None
     backend_capability: BackendCapability | None = None
 
+    # Safety + budget knobs — None means "no enforcement".
+    hooks: Hooks | None = None
+    permissions: PermissionContext | None = None
+    budget: Budget | None = None
+    max_usd: float | None = None  # shortcut: sets budget.max_usd if budget is None
+
+    # Internal state populated in __post_init__ / run loop.
+    _dispatcher: HookDispatcher | None = field(default=None, init=False)
+    _budget_tracker: BudgetTracker | None = field(default=None, init=False)
+    _provider_hint: str | None = field(default=None, init=False)
+
     def __post_init__(self) -> None:
         # Normalize tools input — accept list[Tool] or pre-built ToolRegistry.
         if not isinstance(self.tools, ToolRegistry):
@@ -142,6 +163,19 @@ class Agent:
         # Propagate temperature from capability if user didn't set one.
         if self.temperature is None:
             self.temperature = self.model_capability.recommended_temperature
+
+        # Wire safety surface.
+        self._dispatcher = HookDispatcher(self.hooks or Hooks())
+
+        # Resolve budget — accept either an explicit Budget or shortcut kwargs.
+        if self.budget is None and self.max_usd is not None:
+            self.budget = Budget(max_usd=self.max_usd, max_turns=self.max_steps)
+        if self.budget is not None:
+            self._budget_tracker = BudgetTracker(budget=self.budget)
+
+        # Provider hint for pricing lookups (e.g. "together", "fireworks").
+        if self.backend_capability is not None:
+            self._provider_hint = self.backend_capability.provider_hint or None
 
     def _build_provider(self, ProviderCls: type[Provider], backend_kind: str) -> Provider:
         """Construct a provider with sensible defaults per backend kind."""
@@ -177,21 +211,149 @@ class Agent:
     async def run(self, messages: list[Message]) -> list[Message]:
         """Run the full multi-turn loop and return the updated message list.
 
-        ``messages`` is mutated in place — the same list grows with each
-        assistant turn and tool result. The return value is the same object,
-        for chaining convenience.
+        Drives the full integration:
+          * Streams the provider; assembles assistant message.
+          * For each ``tool_use`` in the assistant message, runs ``PreToolUse``
+            hook → checks permission → dispatches via
+            ``StreamingToolExecutor`` (parallel-safe partitioned).
+          * After the batch finishes, runs ``PostToolUse`` hook per call.
+          * Tracks token + USD usage on a ``BudgetTracker``; raises
+            ``BudgetExceededError`` when limits are crossed.
+          * Fires ``Stop`` when the assistant emits a turn with no tool calls.
+
+        ``messages`` is mutated in place; the same list is returned for chaining.
         """
+
+        assert self._dispatcher is not None  # set in __post_init__
 
         for _ in range(self.max_steps):
             assistant = await self._one_turn(messages)
             messages.append(assistant)
+
+            # Bump turn + cost AFTER the assistant message materializes,
+            # so we don't strand a budget overrun mid-stream.
+            if self._budget_tracker is not None:
+                self._budget_tracker.add_turn()
+                if assistant.usage is not None:
+                    self._budget_tracker.add_usage(
+                        assistant.usage, self.model, backend_hint=self._provider_hint
+                    )
+                # Enforce — raises BudgetExceededError if any limit is over.
+                self._budget_tracker.check()
+
             tool_calls = [b for b in assistant.content if isinstance(b, ToolUseBlock)]
             if not tool_calls:
+                # Fire the Stop hook on natural turn-end (no tool follow-up).
+                await self._dispatcher.dispatch(
+                    "Stop",
+                    HookContext(event="Stop", messages_snapshot=messages),
+                )
                 return messages
-            results = await dispatch_tool_calls(self.tools, tool_calls)
+
+            # Run the tool batch through the streaming executor + safety net.
+            results = await self._run_tool_batch(tool_calls, messages)
             messages.append(UserMessage(content=list(results)))
+
         _log.warning("agent hit max_steps=%d without natural stop", self.max_steps)
         return messages
+
+    async def _run_tool_batch(
+        self,
+        calls: list[ToolUseBlock],
+        messages: list[Message],
+    ) -> list[ToolResultBlock]:
+        """Dispatch a single batch of tool calls under hooks + permissions."""
+
+        assert self._dispatcher is not None
+        registry: ToolRegistry = self.tools  # type: ignore[assignment]
+
+        # Pre-flight every call: PreToolUse hook + permission check.
+        # Each call is either approved (and possibly input-mutated) or
+        # short-circuited to an is_error result block.
+        approved: list[ToolUseBlock] = []
+        short_circuit: dict[str, ToolResultBlock] = {}
+
+        for call in calls:
+            tool = registry.get(call.name)
+            if tool is None:
+                # Unknown tool. Let the executor surface this — it has the
+                # canonical "not found" path. Skip pre-checks.
+                approved.append(call)
+                continue
+
+            # PreToolUse hook
+            ctx = HookContext(
+                event="PreToolUse",
+                tool=tool,
+                input=call.input,
+                messages_snapshot=messages,
+            )
+            hr = await self._dispatcher.dispatch("PreToolUse", ctx)
+            if hr.block:
+                short_circuit[call.id] = ToolResultBlock(
+                    tool_use_id=call.id,
+                    content=f"blocked by hook: {hr.note or 'no reason given'}",
+                    is_error=True,
+                )
+                continue
+
+            # Apply hook-mutated input if any.
+            payload = hr.mutated_input if hr.mutated_input is not None else call.input
+            if payload is not call.input:
+                # ToolUseBlock is frozen — rebuild with new input.
+                call = ToolUseBlock(id=call.id, name=call.name, input=payload)
+
+            # Permission check.
+            if self.permissions is not None:
+                decision = await check_permission(tool, call.input, self.permissions)
+                if isinstance(decision, Deny):
+                    await self._dispatcher.dispatch(
+                        "PermissionDenied",
+                        HookContext(
+                            event="PermissionDenied",
+                            tool=tool,
+                            input=call.input,
+                            arbitrary={"reason": decision.reason},
+                        ),
+                    )
+                    short_circuit[call.id] = ToolResultBlock(
+                        tool_use_id=call.id,
+                        content=f"permission denied: {decision.reason}",
+                        is_error=True,
+                    )
+                    continue
+                # Ask → in v0 we treat Ask as Allow at the loop layer.
+                # Integrators can convert Ask to Deny via the can_use_tool callback.
+
+            approved.append(call)
+
+        # Dispatch approved calls under the StreamingToolExecutor.
+        async with StreamingToolExecutor(registry) as executor:
+            for call in approved:
+                executor.add_tool_call(call)
+            executor_results = await executor.wait_all()
+
+        # PostToolUse hooks for each executed call.
+        for call, result in zip(approved, executor_results):
+            tool = registry.get(call.name)
+            if tool is None:
+                continue
+            event_name = "PostToolUseFailure" if result.is_error else "PostToolUse"
+            await self._dispatcher.dispatch(
+                event_name,
+                HookContext(
+                    event=event_name,
+                    tool=tool,
+                    input=call.input,
+                    output=result.content,
+                ),
+            )
+
+        # Merge short-circuited results with executor results, preserving
+        # original call order.
+        by_id: dict[str, ToolResultBlock] = {r.tool_use_id: r for r in executor_results}
+        by_id.update(short_circuit)
+        return [by_id[c.id] for c in calls]
 
     async def stream(self, messages: list[Message]) -> AsyncIterator[StreamEvent]:
         """Stream the next assistant turn as normalized events.

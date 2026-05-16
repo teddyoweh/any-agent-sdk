@@ -316,6 +316,49 @@ _TABLE: dict[str, ModelCapability] = {
         context_window=131072,
         chat_template_id="chatml",
     ),
+    # Moonshot Kimi
+    "kimi-k2-instruct": ModelCapability(
+        name="kimi-k2-instruct",
+        family="kimi",
+        supports_native_tools=True,
+        context_window=131072,
+        chat_template_id="kimi",
+        recommended_temperature=0.6,
+        family_specific_stops=("<|im_end|>",),  # Kimi uses ChatML-derived tokens
+    ),
+    "kimi-k1.5-instruct": ModelCapability(
+        name="kimi-k1.5-instruct",
+        family="kimi",
+        supports_native_tools=True,
+        context_window=131072,
+        chat_template_id="kimi",
+        recommended_temperature=0.6,
+        family_specific_stops=("<|im_end|>",),
+    ),
+    "moonshot-v1-128k": ModelCapability(
+        name="moonshot-v1-128k",
+        family="kimi",
+        supports_native_tools=True,
+        context_window=131072,
+        chat_template_id="kimi",
+        recommended_temperature=0.3,
+    ),
+    "moonshot-v1-32k": ModelCapability(
+        name="moonshot-v1-32k",
+        family="kimi",
+        supports_native_tools=True,
+        context_window=32768,
+        chat_template_id="kimi",
+        recommended_temperature=0.3,
+    ),
+    "moonshot-v1-8k": ModelCapability(
+        name="moonshot-v1-8k",
+        family="kimi",
+        supports_native_tools=True,
+        context_window=8192,
+        chat_template_id="kimi",
+        recommended_temperature=0.3,
+    ),
 }
 
 
@@ -375,6 +418,14 @@ _FAMILY_DEFAULTS: dict[str, ModelCapability] = {
         context_window=131072,
         chat_template_id="cohere",
     ),
+    "kimi": ModelCapability(
+        name="kimi-unknown",
+        family="kimi",
+        supports_native_tools=True,
+        context_window=131072,
+        chat_template_id="kimi",
+        family_specific_stops=("<|im_end|>",),
+    ),
 }
 
 # Heuristic: substrings to family
@@ -394,6 +445,8 @@ _FAMILY_HINTS: tuple[tuple[str, str], ...] = (
     ("gemma", "gemma"),
     ("command-r", "cohere"),
     ("aya", "cohere"),
+    ("kimi", "kimi"),
+    ("moonshot", "kimi"),
     ("internlm", "qwen2.5"),  # ChatML-shaped
     ("granite", "llama3"),
     ("yi", "qwen2.5"),

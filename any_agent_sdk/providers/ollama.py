@@ -70,6 +70,9 @@ from .base import HTTPProviderMixin
 
 DEFAULT_BASE_URL = "http://localhost:11434"
 
+# NOTE: we render with simple ``%`` substitution rather than ``.format()``
+# because the literal example below contains JSON braces — ``str.format``
+# would treat them as positional placeholders and KeyError on `'"name"'`.
 _HERMES_PROMPT = (
     "You have access to the following tools. To call a tool, emit a single\n"
     "<tool_call> block in your response. You can call multiple tools in one\n"
@@ -77,7 +80,7 @@ _HERMES_PROMPT = (
     "<tool_call>\n"
     '{"name": "<tool_name>", "arguments": {<JSON object>}}\n'
     "</tool_call>\n\n"
-    "Available tools:\n{tools_json}\n\n"
+    "Available tools:\n%(tools_json)s\n\n"
     "When you receive <tool_result> messages, continue your response using\n"
     "the new information. If you have completed the user's request, respond\n"
     "without any <tool_call> blocks."
@@ -200,7 +203,7 @@ class OllamaProvider(HTTPProviderMixin):
         effective_system = system
         if tools and not use_native_tools:
             tools_json = _JSON_ENCODER.encode(tools).decode("utf-8")
-            inject = _HERMES_PROMPT.format(tools_json=tools_json)
+            inject = _HERMES_PROMPT % {"tools_json": tools_json}
             effective_system = inject if system is None else f"{system}\n\n{inject}"
 
         payload: dict[str, Any] = {

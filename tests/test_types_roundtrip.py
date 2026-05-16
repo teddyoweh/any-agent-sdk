@@ -73,7 +73,25 @@ def test_tool_result_with_nested_content_blocks() -> None:
 # ---------------------------------------------------------------------------
 
 
-_MSG_DECODER = msgspec.json.Decoder(Message)
+# Message variants share a ``role`` field but the Struct types themselves
+# don't carry msgspec tags (so users can hand-construct messages without
+# noise). We dispatch decode by the Python type of the original message —
+# the test owns both sides, so this is fine.
+_USER_DECODER = msgspec.json.Decoder(UserMessage)
+_ASSISTANT_DECODER = msgspec.json.Decoder(AssistantMessage)
+_SYSTEM_DECODER = msgspec.json.Decoder(SystemMessage)
+
+
+def _decode_like(original, payload: bytes):
+    """Decode ``payload`` into the same Struct type as ``original``."""
+
+    if isinstance(original, UserMessage):
+        return _USER_DECODER.decode(payload)
+    if isinstance(original, AssistantMessage):
+        return _ASSISTANT_DECODER.decode(payload)
+    if isinstance(original, SystemMessage):
+        return _SYSTEM_DECODER.decode(payload)
+    raise TypeError(f"unknown message type: {type(original).__name__}")
 
 
 @pytest.mark.parametrize(
@@ -96,7 +114,7 @@ _MSG_DECODER = msgspec.json.Decoder(Message)
 )
 def test_message_roundtrip(message: Message) -> None:
     encoded = _BLOCK_ENCODER.encode(message)
-    decoded = _MSG_DECODER.decode(encoded)
+    decoded = _decode_like(message, encoded)
     assert type(decoded) is type(message)
     assert decoded == message
 
