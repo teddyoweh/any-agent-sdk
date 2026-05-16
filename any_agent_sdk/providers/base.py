@@ -1,15 +1,15 @@
-"""Provider protocol + registry.
+"""Provider protocol + lazy registry.
 
-A provider is a thin async object that:
-  1. Takes a list of universal ``Message``s + tools + model params
-  2. Calls the underlying API with streaming enabled
-  3. Yields normalized ``StreamEvent``s
+A provider is a backend adapter (an HTTP wire format) — not a model. One
+adapter handles N models that speak the same protocol. The OpenAI-compat
+adapter alone covers vLLM, Together, Fireworks, Groq, OpenRouter, Cerebras,
+DeepInfra, Anyscale, DeepSeek's own API, and any future provider that
+implements ``POST /v1/chat/completions``.
 
-Everything else (the agent loop, tool dispatch, MCP, sub-agents) is provider-
-agnostic.
-
-The registry is a string → factory map. Resolution is lazy — we don't import
-``providers.bedrock`` (which pulls boto3) unless someone asks for ``bedrock``.
+The registry is a string → factory map. Resolution is lazy by design — we
+don't import ``providers.ollama`` (which doesn't pull anything heavy but
+nonetheless costs ~5 ms of parsing on cold start) unless someone asks for
+the ``ollama`` adapter.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
+from ..capabilities import BackendCapability, ModelCapability
 from ..events import StreamEvent
 from ..types import Message
 
@@ -29,6 +30,7 @@ class Provider(Protocol):
     """Adapter interface. Each provider lives in its own module."""
 
     name: str
+    backend_capability: BackendCapability
 
     async def stream(
         self,
@@ -40,6 +42,7 @@ class Provider(Protocol):
         max_tokens: int = 1024,
         temperature: float | None = None,
         extra: dict[str, Any] | None = None,
+        model_capability: ModelCapability | None = None,
     ) -> AsyncIterator[StreamEvent]:
         """Open a streaming request and yield normalized events."""
         ...
@@ -55,11 +58,12 @@ class Provider(Protocol):
 
 # Maps provider name -> (module path, class name). Imported on first use.
 _LAZY_PROVIDERS: dict[str, tuple[str, str]] = {
-    "anthropic": ("any_agent_sdk.providers.anthropic", "AnthropicProvider"),
-    "openai": ("any_agent_sdk.providers.openai", "OpenAIProvider"),
-    "gemini": ("any_agent_sdk.providers.gemini", "GeminiProvider"),
-    "bedrock": ("any_agent_sdk.providers.bedrock", "BedrockProvider"),
-    "local": ("any_agent_sdk.providers.local", "LocalProvider"),
+    "openai_compat": ("any_agent_sdk.providers.openai_compat", "OpenAICompatProvider"),
+    "ollama": ("any_agent_sdk.providers.ollama", "OllamaProvider"),
+    "llamacpp": ("any_agent_sdk.providers.llamacpp", "LlamaCppProvider"),
+    "tgi": ("any_agent_sdk.providers.tgi", "TGIProvider"),
+    "modal": ("any_agent_sdk.providers.modal_provider", "ModalProvider"),
+    "mock": ("any_agent_sdk.providers.mock", "MockProvider"),
 }
 
 # Cache of resolved factories.
@@ -86,30 +90,37 @@ def resolve(name: str) -> type[Provider]:
     return cls
 
 
-def detect_provider(model: str) -> str:
-    """Best-effort provider detection from the model name.
+def detect_provider(model_or_url: str, *, backend_hint: str | None = None) -> str:
+    """Best-effort backend detection from a model name OR a backend URL.
 
-    Rules
-    -----
-    * ``claude-*`` → anthropic
-    * ``gpt-*``, ``o1-*``, ``o3-*``, ``o4-*`` → openai
-    * ``gemini-*`` → gemini
-    * ``anthropic.*`` (Bedrock model IDs) → bedrock
-    * Anything containing ``/`` → local (Ollama/vLLM-style ``org/model``)
+    Resolution rules
+    ----------------
+    * Explicit ``backend_hint`` wins.
+    * URL with ``:11434`` or ``ollama`` → ollama.
+    * URL with ``llamacpp`` or ``:8080`` → llamacpp.
+    * URL with ``tgi`` or ``text-generation-inference`` → tgi.
+    * URL containing a known hosted provider name → openai_compat.
+    * Bare ``http://`` or ``https://`` URL → openai_compat (the default).
+    * ``"mock"`` literal → mock.
+    * Otherwise: openai_compat.
     """
 
-    m = model.lower()
-    if m.startswith("claude"):
-        return "anthropic"
-    if m.startswith(("gpt", "o1", "o3", "o4")):
-        return "openai"
-    if m.startswith("gemini"):
-        return "gemini"
-    if m.startswith(("anthropic.", "amazon.", "meta.")):
-        return "bedrock"
-    if "/" in model:
-        return "local"
-    raise ValueError(f"cannot detect provider from model name {model!r}; pass provider= explicitly")
+    if backend_hint:
+        return backend_hint
+
+    s = model_or_url.lower()
+    if s == "mock":
+        return "mock"
+    if "11434" in s or "ollama" in s:
+        return "ollama"
+    if "llamacpp" in s or "llama.cpp" in s:
+        return "llamacpp"
+    if "tgi" in s or "text-generation-inference" in s:
+        return "tgi"
+    if s.startswith(("http://", "https://")):
+        return "openai_compat"
+    # Bare model name with no URL — default to openai_compat (with localhost vllm).
+    return "openai_compat"
 
 
 # ---------------------------------------------------------------------------
@@ -117,9 +128,9 @@ def detect_provider(model: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class _HTTPProviderMixin:
+class HTTPProviderMixin:
     """Convenience base for HTTP-based providers. Stores a client and exposes
-    a single ``aclose``. Adapters can inherit and add the ``stream`` method."""
+    a single ``aclose``. Adapters inherit and add the ``stream`` method."""
 
     client: httpx.AsyncClient
 

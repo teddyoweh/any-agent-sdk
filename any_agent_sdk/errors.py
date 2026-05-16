@@ -61,3 +61,40 @@ class ToolExecutionError(AgentError):
 
 class StreamProtocolError(AgentError):
     """The provider's stream broke framing (bad SSE, malformed JSON, etc.)."""
+
+
+class BudgetExceededError(AgentError):
+    """A configured budget (turns, tokens, USD) was exceeded."""
+
+    __slots__ = ("kind", "limit", "used")
+
+    def __init__(self, kind: str, limit: float, used: float):
+        super().__init__(f"budget {kind} exceeded: used {used} >= limit {limit}")
+        self.kind = kind
+        self.limit = limit
+        self.used = used
+
+
+class PermissionDeniedError(AgentError):
+    """``canUseTool`` denied a tool call, or a rule blocked it.
+
+    The agent loop catches this and turns it into a ``tool_result``
+    block with ``is_error=True``; it's a hard error only when raised
+    outside the dispatch context.
+    """
+
+    __slots__ = ("tool_name", "tool_use_id", "reason")
+
+    def __init__(self, tool_name: str, tool_use_id: str, reason: str):
+        super().__init__(f"permission denied for tool {tool_name!r}: {reason}")
+        self.tool_name = tool_name
+        self.tool_use_id = tool_use_id
+        self.reason = reason
+
+
+class CapabilityError(AgentError):
+    """A required capability isn't available on the (model, backend) pair."""
+
+
+class TemplateError(AgentError):
+    """Chat template rendering failed (missing variables, bad template, ...)."""
