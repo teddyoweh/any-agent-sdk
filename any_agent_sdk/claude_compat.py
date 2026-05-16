@@ -353,6 +353,15 @@ class ResultMessage(msgspec.Struct, omit_defaults=True):
     stop_reason: str | None = None
     total_cost_usd: float = 0.0
     session_id: str = ""
+    # List of ``{tool_name, tool_use_id, tool_input}`` records for every
+    # tool call ``can_use_tool`` denied during the run. Matches
+    # claude_agent_sdk's ``ResultMessage.permission_denials`` so audit
+    # tooling that walks this field works unchanged.
+    permission_denials: list[dict] = msgspec.field(default_factory=list)
+    # Per-turn usage rolled up. Populated when the agent had a budget
+    # tracker; otherwise zeros.
+    usage: dict = msgspec.field(default_factory=dict)
+    modelUsage: dict = msgspec.field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

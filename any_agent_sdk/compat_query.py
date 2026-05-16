@@ -170,6 +170,11 @@ async def query(
         if pricing is not None:
             total_cost_usd = pricing.cost(agg_usage)
 
+    # Snapshot permission denials before _build_result so a closure-
+    # mutated list doesn't surprise us. Each entry is a plain dict so
+    # it serializes through msgspec cleanly.
+    denials = list(getattr(agent, "_permission_denials", []))
+
     yield _build_result(
         session_id=session_id,
         num_turns=num_turns,
@@ -183,6 +188,7 @@ async def query(
         total_cost_usd=total_cost_usd,
         last_stop_reason=last_stop_reason,
         errors=error_strings,
+        permission_denials=denials,
     )
 
 
@@ -323,8 +329,24 @@ def _build_result(
     total_cost_usd: float,
     last_stop_reason: str | None,
     errors: list[str],
+    permission_denials: list | None = None,
 ) -> ResultMessage:
     duration_ms = int((time.monotonic() - started_at) * 1000)
+    # Flatten Usage to a dict for the wire — keeps ResultMessage
+    # decoupled from the internal Usage struct and matches Claude SDK.
+    usage_dict = (
+        {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+        }
+        if (usage.input_tokens or usage.output_tokens)
+        else {}
+    )
+    model_usage_dict = (
+        {model: dict(usage_dict, costUSD=total_cost_usd)} if usage_dict else {}
+    )
     return ResultMessage(
         subtype=error_subtype if is_error else "success",
         duration_ms=duration_ms,
@@ -335,4 +357,7 @@ def _build_result(
         stop_reason=last_stop_reason,
         total_cost_usd=total_cost_usd,
         session_id=session_id,
+        permission_denials=list(permission_denials or []),
+        usage=usage_dict,
+        modelUsage=model_usage_dict,
     )

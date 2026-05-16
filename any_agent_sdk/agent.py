@@ -138,6 +138,11 @@ class Agent:
     _dispatcher: HookDispatcher | None = field(default=None, init=False)
     _budget_tracker: BudgetTracker | None = field(default=None, init=False)
     _provider_hint: str | None = field(default=None, init=False)
+    # Permission denials accumulated across the run. Each entry is a
+    # ``{tool_name, tool_use_id, tool_input}`` dict matching the Claude
+    # SDK's ``SDKPermissionDenial`` shape. ``query()`` reads this after
+    # ``run()`` returns and populates ``SDKResultMessage.permission_denials``.
+    _permission_denials: list = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         # Normalize tools input — accept list[Tool] or pre-built ToolRegistry.
@@ -393,6 +398,17 @@ class Agent:
                             input=call.input,
                             arbitrary={"reason": decision.reason},
                         ),
+                    )
+                    # Record for the SDKResultMessage.permission_denials
+                    # surface. Shape matches Claude SDK's SDKPermissionDenial
+                    # so query() can pass straight through without
+                    # transforming.
+                    self._permission_denials.append(
+                        {
+                            "tool_name": call.name,
+                            "tool_use_id": call.id,
+                            "tool_input": dict(call.input or {}),
+                        }
                     )
                     short_circuit[call.id] = ToolResultBlock(
                         tool_use_id=call.id,
