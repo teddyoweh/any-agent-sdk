@@ -183,57 +183,6 @@ Auto-routing recognizes these shapes (see `any_agent_sdk/routing.py`). Pass `bac
 
 ---
 
-## What's shipped
-
-```
-any_agent_sdk/
-  agent.py               Multi-turn loop with tool dispatch, hooks, permissions, budget
-  claude_compat.py       Drop-in surface: ClaudeAgentOptions, ClaudeSDKClient, AgentDefinition,
-                         Plugin, PermissionResult{Allow,Deny}, HookMatcher, ToolPermissionContext
-  compat_query.py        query() yielding Claude-flat-shape messages (AssistantMessage,
-                         ResultMessage, SystemMessage, UserMessage)
-  query.py               TS-SDK-shape query() (SDKAssistantMessage with nested .message.content)
-  types.py               msgspec tagged unions — TextBlock, ToolUseBlock, ThinkingBlock, ...
-  events.py              StreamEvent variants — MessageStart, ContentBlockDelta, ...
-  tools.py               @tool decorator, ToolRegistry, parallel dispatcher
-  hooks.py               28 hook events (PreToolUse, PostToolUse, SessionStart, ...)
-  permissions.py         can_use_tool callback wiring, PermissionResultAllow.updated_input
-                         rewrites tool args before dispatch
-  budget.py              Per-model pricing, max_usd ceiling, BudgetExceededError
-  memory.py              ~/.any-agent/memory/ entries + index; isMeta system reminders
-  session.py             JSONL transcripts, fork/resume
-  compact.py             Auto-compaction at token threshold
-  subagent.py            AgentDefinition execution
-  skills.py              Skill loading + activation
-  system_reminder.py     <system-reminder> wrapping + live context injection
-  retry.py               Provider-error retry with backoff
-  http.py                Shared httpx.AsyncClient + SSE parser
-  cli.py                 `any-agent` CLI
-  capabilities.py        ModelCapability tables — picks tool-use path A/B/C per model
-  builtin_tools/         WebFetch (Exa), WebSearch (Exa), file ops
-  mcp/                   Client + server (stdio, sse, http, in-process)
-  streaming/             ToolCallTextParser, ThinkingParser stacks for Path B/C
-  providers/
-    base.py              Provider protocol + lazy registry
-    openai_compat.py     vLLM, Together, Fireworks, Groq, OpenRouter, Cerebras
-    ollama.py            Ollama native API
-    llamacpp.py          llama.cpp server
-    tgi.py               HuggingFace TGI
-    mock.py              Scripted provider for tests
-  examples/
-    quickstart.py, quick_start.py, ollama_local.py, fireworks_hosted.py,
-    vllm_self_hosted.py, tools_option.py, mcp_calculator.py, mcp_filesystem.py,
-    multi_agent_research.py, research_agent.py, max_budget_usd.py,
-    stderr_callback_example.py, streaming_mode_ipython.py, streaming_render.py,
-    system_prompt.py, with_thinking.py
-tests/                   105 test functions across 21 files
-docs/
-  plan.md                Full plan
-  upstream-comparison.md What we learned reading 1,902 TS files of Claude Code
-```
-
----
-
 ## Why this exists
 
 The Claude Agent SDK is the best-designed agent runtime in the open. Streaming tool dispatch, 28-event hook system, permission rules per source, MCP across four transports, sub-agents, sessions with fork/resume, auto-compaction — none of the OSS alternatives ship the whole set. LangGraph is too heavy and skips MCP. smolagents is too small. llama-stack is tightly scoped. The Anthropic and OpenAI agent SDKs are bound to their hosted APIs.
