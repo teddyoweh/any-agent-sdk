@@ -14,12 +14,6 @@ That's it. Every canonical Claude SDK example runs verbatim. The wire format und
 
 ---
 
-## Status
-
-**Pre-1.0, but the surface is real.** 202 tests passing. Six of Anthropic's own canonical SDK examples run verbatim against DeepSeek-R1 1.5B on local Ollama. The drop-in compatibility layer (`ClaudeAgentOptions`, `ClaudeSDKClient`, `query()`, `AgentDefinition`, `Plugin`, `PermissionResultAllow/Deny`, `HookMatcher`, `ToolPermissionContext`, `create_sdk_mcp_server`) is wired through to the agent loop — not a stub.
-
----
-
 ## Quick start
 
 ```bash
