@@ -7,6 +7,7 @@ The client speaks the v0-relevant subset of the MCP protocol:
 * ``tools/list`` (discover tools)
 * ``tools/call`` (invoke a tool, returning ``CallToolResult``)
 * ``notifications/cancelled`` (best-effort cancellation of a request)
+* ``elicitation/create`` (server-initiated; client routes to handler)
 
 Everything else — resources, prompts, sampling, logging — is out of scope
 for the v0 surface. They can be added by extending ``_request`` callers;
@@ -24,18 +25,22 @@ incoming message is one of:
   drops everything except ``notifications/cancelled``; future work hooks
   ``notifications/progress`` and ``notifications/message`` into the agent's
   hook system.
-* a *request* from the server (``id`` and ``method``) — v0 does not
-  expose server-initiated requests beyond elicitation. We log+ignore
-  unknown ones.
+* a *request* from the server (``id`` + ``method``) — currently we
+  recognize ``elicitation/create`` and route it to the client-supplied
+  ``elicitation_handler``. Any other server-initiated method gets a
+  ``-32601 method not found`` response. We never block the read loop on
+  the handler; it runs in the same task group as the read loop.
 
 Request ids are monotonic ints. A response carrying ``error`` raises
-``MCPError``. The special elicitation error code (-32042) is repackaged
-into ``MCPElicitationRequest`` so the agent loop can prompt the user.
+``MCPError``. The legacy elicitation error code (-32042) is still
+repackaged into ``MCPElicitationRequest`` for back-compat with old
+servers that embed the prompt as an error rather than a real request.
 """
 
 from __future__ import annotations
 
 import itertools
+import logging
 from typing import Any
 
 import anyio
@@ -49,6 +54,9 @@ from .transports.sse import SseTransport
 from .transports.stdio import StdioTransport
 from .types import (
     CallToolResult,
+    ElicitationHandler,
+    ElicitationRequest,
+    ElicitationResult,
     HttpServerConfig,
     MCPTool,
     SdkServerConfig,
@@ -56,6 +64,8 @@ from .types import (
     SseServerConfig,
     StdioServerConfig,
 )
+
+_log = logging.getLogger(__name__)
 
 # JSON-RPC error code reserved by MCP for elicitation requests. The server
 # returns this code on tools/call when it needs the user to answer a
@@ -133,6 +143,7 @@ class MCPClient:
         "server_id",
         "server_info",
         "server_capabilities",
+        "elicitation_handler",
         "_transport",
         "_id_counter",
         "_pending",
@@ -141,13 +152,24 @@ class MCPClient:
         "_initialized",
     )
 
-    def __init__(self, config: ServerConfig, *, server_id: str | None = None) -> None:
+    def __init__(
+        self,
+        config: ServerConfig,
+        *,
+        server_id: str | None = None,
+        elicitation_handler: ElicitationHandler | None = None,
+    ) -> None:
         self.config = config
         # Stable id used by MCPTool.server_id. Falls back to a synthetic
         # name based on transport type when the config doesn't carry one.
         self.server_id = server_id or _derive_server_id(config)
         self.server_info: dict[str, Any] = {}
         self.server_capabilities: dict[str, Any] = {}
+        # Callback that produces an ``ElicitationResult`` for an inbound
+        # ``elicitation/create`` request. ``None`` means the client doesn't
+        # advertise the capability and will respond to such requests with
+        # ``-32601 method not found``.
+        self.elicitation_handler: ElicitationHandler | None = elicitation_handler
         self._transport: Transport | None = None
         self._id_counter = itertools.count(1)
         self._pending: dict[int, _PendingRequest] = {}
@@ -289,15 +311,20 @@ class MCPClient:
     # -- handshake ----------------------------------------------------------
 
     async def _initialize(self) -> None:
+        # Advertise client capabilities. ``elicitation: {}`` tells the
+        # server "feel free to send me elicitation/create requests" —
+        # only set when a handler is registered, otherwise a server that
+        # honors our advertised capabilities and then sends us a prompt
+        # would deadlock waiting for an answer we can't produce.
+        capabilities: dict[str, Any] = {}
+        if self.elicitation_handler is not None:
+            capabilities["elicitation"] = {}
+
         result = await self._request(
             "initialize",
             {
                 "protocolVersion": _PROTOCOL_VERSION,
-                "capabilities": {
-                    # We don't currently advertise client-side features
-                    # (sampling, roots, etc.) — but the field must be a
-                    # dict per spec.
-                },
+                "capabilities": capabilities,
                 "clientInfo": {
                     "name": "any-agent-sdk",
                     "version": "0.1.0",
@@ -367,7 +394,8 @@ class MCPClient:
         if not isinstance(message, dict):
             return
         mid = message.get("id")
-        if mid is not None and "method" not in message:
+        method = message.get("method")
+        if mid is not None and method is None:
             # Response to one of our requests.
             try:
                 key = int(mid)
@@ -379,10 +407,112 @@ class MCPClient:
             pending.response = message
             pending.event.set()
             return
-        # Server-initiated notification or request. v0: log+ignore.
-        # (Future work: hook progress + log message notifications into
-        # the agent's hook system; respond to sampling/elicitation
-        # round-trips here rather than only via tools/call error code.)
+        if method is not None and mid is not None:
+            # Server-initiated REQUEST. Spawn the handler in our task
+            # group so the read loop stays responsive — handlers may
+            # take human time (CLI prompt, GUI dialog).
+            if self._task_group is None:
+                # No task group means we're closing; drop silently.
+                return
+            self._task_group.start_soon(self._handle_server_request, message)
+            return
+        # Server-initiated NOTIFICATION (no id, has method). v0: log and
+        # ignore everything except notifications/cancelled, which the
+        # spec lets either side send. Future hook integration goes here.
+        if method == "notifications/cancelled":
+            return
+        _log.debug("mcp: dropping server notification %r", method)
+
+    async def _handle_server_request(self, message: dict[str, Any]) -> None:
+        """Dispatch a server-initiated request to the right handler.
+
+        Currently supports ``elicitation/create``. Anything else gets a
+        ``-32601 method not found`` reply so the server isn't left
+        hanging on a request id it owns.
+        """
+
+        mid = message.get("id")
+        method = message.get("method")
+        params = message.get("params") or {}
+        try:
+            if method == "elicitation/create":
+                await self._handle_elicitation(mid, params)
+            else:
+                await self._send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": mid,
+                        "error": {
+                            "code": -32601,
+                            "message": f"method not found: {method!r}",
+                        },
+                    }
+                )
+        except TransportClosed:
+            # Client is shutting down; nothing more to do.
+            pass
+        except Exception as exc:  # noqa: BLE001 — never crash the read loop
+            _log.warning("mcp: server request handler raised: %r", exc)
+            try:
+                await self._send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": mid,
+                        "error": {
+                            "code": -32603,
+                            "message": f"client handler error: {exc!r}",
+                        },
+                    }
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _handle_elicitation(self, mid: Any, params: dict[str, Any]) -> None:
+        """Route an ``elicitation/create`` request to the client's handler.
+
+        If no handler is registered we return a ``-32601`` error: the spec
+        says the server should respect the client's advertised capabilities,
+        but unprincipled servers exist and we don't want to silently hang.
+        """
+
+        if self.elicitation_handler is None:
+            await self._send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": mid,
+                    "error": {
+                        "code": -32601,
+                        "message": "client did not register an elicitation_handler",
+                    },
+                }
+            )
+            return
+
+        request = ElicitationRequest(
+            message=str(params.get("message", "")),
+            requested_schema=params.get("requestedSchema") or {},
+            raw=dict(params),
+        )
+        result = await self.elicitation_handler(request)
+        if not isinstance(result, ElicitationResult):
+            # Lenient: accept a plain dict if the handler returned one.
+            if isinstance(result, dict):
+                result = ElicitationResult(
+                    action=result.get("action", "accept"),  # type: ignore[arg-type]
+                    content=result.get("content") or {},
+                )
+            else:
+                raise TypeError(
+                    "elicitation_handler must return ElicitationResult, "
+                    f"got {type(result).__name__}"
+                )
+        await self._send(
+            {
+                "jsonrpc": "2.0",
+                "id": mid,
+                "result": {"action": result.action, "content": result.content},
+            }
+        )
 
 
 # ---------------------------------------------------------------------------

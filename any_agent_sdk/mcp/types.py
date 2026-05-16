@@ -18,7 +18,8 @@ Design
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Annotated, Any, Union
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Union
 
 import msgspec
 
@@ -188,3 +189,69 @@ class CallToolResult(msgspec.Struct, omit_defaults=True):
                 # Best-effort: stringify the whole block.
                 parts.append(str(block))
         return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Elicitation — server-initiated mid-tool prompts to the user
+# ---------------------------------------------------------------------------
+
+
+ElicitAction = Literal["accept", "decline", "cancel"]
+
+
+class ElicitationRequest(msgspec.Struct, omit_defaults=True):
+    """Server is asking the user (via the client) for input mid-tool-call.
+
+    Mirrors the MCP ``elicitation/create`` request shape. ``message`` is the
+    human-readable prompt. ``requested_schema`` is an optional JSON Schema
+    describing the shape of the answer the server expects — clients with a
+    UI render a form from it; headless clients can ignore it and return
+    free-form content.
+
+    ``raw`` is the full params payload from the server, kept so handlers
+    can inspect MCP fields we haven't surfaced as first-class attributes
+    yet (e.g. ``progressToken``, future spec additions).
+    """
+
+    message: str
+    requested_schema: dict[str, Any] = {}
+    raw: dict[str, Any] = {}
+
+
+class ElicitationResult(msgspec.Struct, omit_defaults=True):
+    """Client's response to an ``ElicitationRequest``.
+
+    ``action``:
+      * ``"accept"`` — user filled in ``content`` and submitted.
+      * ``"decline"`` — user actively declined (e.g. "no, don't ask me that").
+      * ``"cancel"``  — user dismissed without answering (e.g. closed dialog).
+
+    ``content`` is the structured answer when ``action == "accept"``; for
+    decline/cancel it's left empty. The server interprets ``content`` against
+    its own ``requested_schema``.
+    """
+
+    action: ElicitAction = "accept"
+    content: dict[str, Any] = {}
+
+    @classmethod
+    def accept(cls, content: dict[str, Any] | None = None) -> "ElicitationResult":
+        """Convenience: ``ElicitationResult.accept({"name": "Ada"})``."""
+        return cls(action="accept", content=content or {})
+
+    @classmethod
+    def decline(cls) -> "ElicitationResult":
+        """User actively declined to answer."""
+        return cls(action="decline", content={})
+
+    @classmethod
+    def cancel(cls) -> "ElicitationResult":
+        """User dismissed the prompt without answering."""
+        return cls(action="cancel", content={})
+
+
+# An async callback the MCPClient invokes when the server sends an
+# elicitation/create request. The handler decides how to surface the
+# request to the user (CLI prompt, GUI dialog, web form, …) and returns
+# the answer.
+ElicitationHandler = Callable[[ElicitationRequest], Awaitable[ElicitationResult]]
