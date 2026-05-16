@@ -675,7 +675,14 @@ async def query(
         total_cost_usd=total_cost_usd,
         usage=agg_usage,
         modelUsage=model_usage,
-        permission_denials=[],  # plumbing for this lands when permissions wire-up grows
+        permission_denials=[
+            SDKPermissionDenial(
+                tool_name=d["tool_name"],
+                tool_use_id=d["tool_use_id"],
+                tool_input=d.get("tool_input") or {},
+            )
+            for d in getattr(agent, "_permission_denials", []) or []
+        ],
         uuid=_new_uuid(),
         session_id=session_id,
     )

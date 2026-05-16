@@ -217,6 +217,17 @@ class ClaudeAgentOptions:
 
         if self.permission_mode is not None:
             opts["permission_mode"] = self.permission_mode
+        # can_use_tool plumbing: build a PermissionContext so the agent
+        # loop actually invokes the callback at dispatch time. Without
+        # this, ``ClaudeAgentOptions(can_use_tool=...)`` was silently
+        # accepted but never used.
+        if self.can_use_tool is not None or self.permission_mode is not None:
+            from .permissions import PermissionContext  # local: avoid import cycle
+
+            opts["permissions"] = PermissionContext(
+                mode=self.permission_mode or "default",
+                can_use_tool=self.can_use_tool,
+            )
         if self.hooks is not None:
             # Convert Claude-style dict-of-event-name → list[HookMatcher]
             # into our Hooks dataclass. Lazy import to avoid cycles.
