@@ -265,8 +265,8 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] Memory entries + index
 - [x] `<system-reminder>` + `isMeta` injection
 - [x] Auto-compaction at token threshold
-- [ ] Session fork
-- [ ] Session resume from arbitrary checkpoint
+- [x] Session fork
+- [x] Session resume from arbitrary checkpoint
 
 **Budget**
 - [x] Per-model pricing table
