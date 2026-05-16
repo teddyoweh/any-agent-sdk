@@ -234,7 +234,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] Gemini OpenAI-compat endpoint
 - [x] Mock provider for tests
 - [x] Auto-route from model name shape — no `backend=` needed
-- [ ] Modal serverless adapter
+- [x] Modal serverless adapter
 - [ ] Anthropic via separate `anthropic_passthrough` (for parity testing only)
 
 **Tool use**

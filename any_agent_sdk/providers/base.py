@@ -96,6 +96,7 @@ def detect_provider(model_or_url: str, *, backend_hint: str | None = None) -> st
     Resolution rules
     ----------------
     * Explicit ``backend_hint`` wins.
+    * ``modal:...`` model spec or URL ending in ``modal.run`` → modal.
     * URL with ``:11434`` or ``ollama`` → ollama.
     * URL with ``llamacpp`` or ``:8080`` → llamacpp.
     * URL with ``tgi`` or ``text-generation-inference`` → tgi.
@@ -111,6 +112,12 @@ def detect_provider(model_or_url: str, *, backend_hint: str | None = None) -> st
     s = model_or_url.lower()
     if s == "mock":
         return "mock"
+    # Modal serverless: ``modal:workspace/app`` spec form, or any URL on
+    # the modal.run host. Checked before the generic URL fallback so a
+    # Modal endpoint doesn't silently route to the openai_compat default
+    # (which would skip Modal-Key auth + the modal backend profile).
+    if s.startswith("modal:") or "modal.run" in s:
+        return "modal"
     if "11434" in s or "ollama" in s:
         return "ollama"
     if "llamacpp" in s or "llama.cpp" in s:
