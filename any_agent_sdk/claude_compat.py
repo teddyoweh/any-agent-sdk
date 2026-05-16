@@ -113,8 +113,14 @@ class ClaudeAgentOptions:
     system_prompt: str | dict[str, Any] | None = None
     model: str | None = None
     backend: str | None = None
-    max_turns: int = 20
-    max_tokens: int = 1024
+    # ``max_turns`` and ``max_tokens`` default to ``None`` (not the
+    # concrete number) so ``setting_sources`` can fill them from disk;
+    # the runtime fallback (20 turns / 1024 tokens) lives in
+    # :func:`compat_query._build_agent`. This mirrors how the Claude SDK
+    # marks these as optional rather than forcing a default at the
+    # dataclass layer.
+    max_turns: int | None = None
+    max_tokens: int | None = None
     temperature: float | None = None
 
     # Tools
@@ -191,8 +197,10 @@ class ClaudeAgentOptions:
             opts["model"] = self.model
         if self.backend:
             opts["backend"] = self.backend
-        opts["max_turns"] = self.max_turns
-        opts["max_tokens"] = self.max_tokens
+        if self.max_turns is not None:
+            opts["max_turns"] = self.max_turns
+        if self.max_tokens is not None:
+            opts["max_tokens"] = self.max_tokens
         if self.temperature is not None:
             opts["temperature"] = self.temperature
 
@@ -286,6 +294,12 @@ class ClaudeAgentOptions:
         if self.persist:
             opts["persist"] = True
         opts["include_memory"] = self.include_memory
+
+        # setting_sources flows through as-is. compat_query._build_agent
+        # loads them, merges in declared order, and overlays UNDER the
+        # explicit options here (so anything the user just set wins).
+        if self.setting_sources is not None:
+            opts["setting_sources"] = list(self.setting_sources)
 
         # User-supplied extras win over our auto-stashed ones.
         if self.extra:

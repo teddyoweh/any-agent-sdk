@@ -222,7 +222,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] `WebFetch` / `WebSearch` built-in tools (Exa-backed)
 - [x] `CLIConnectionError`, `ClaudeSDKError`
 - [x] `ToolPermissionContext.signal` for cancellation (`anyio.Event`, fired by `Agent.cancel()`)
-- [ ] `setting_sources` actually loading and persisting per source
+- [x] `setting_sources` actually loading and persisting per source
 - [ ] Streaming-mode `client.query()` with mid-stream tool dispatch
 
 **Backends**

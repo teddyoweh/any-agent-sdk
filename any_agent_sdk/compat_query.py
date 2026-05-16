@@ -214,6 +214,20 @@ def _normalize_options(options: ClaudeAgentOptions | dict[str, Any] | None) -> d
 def _build_agent(opts: dict[str, Any]) -> Agent:
     """Construct an Agent from the dict-form options with sensible defaults."""
 
+    # Apply on-disk settings layered UNDERNEATH the user's options. The
+    # caller's explicit ClaudeAgentOptions field always wins; settings
+    # only fill the blanks. This is what makes
+    # ``ClaudeAgentOptions(setting_sources=["user", "project"])`` actually
+    # affect the agent's model / system prompt / allow lists, instead of
+    # the field being merely typed-and-ignored.
+    sources = opts.get("setting_sources")
+    if sources:
+        from .settings import apply_settings_to_options, load_settings
+
+        loaded = load_settings(sources, cwd=opts.get("cwd"))
+        if loaded:
+            opts = apply_settings_to_options(opts, loaded)
+
     model = opts.get("model") or os.environ.get(
         "ANY_AGENT_MODEL", "qwen2.5-7b-instruct"
     )
@@ -254,7 +268,7 @@ def _build_agent(opts: dict[str, Any]) -> Agent:
         "model", "backend", "tools", "system", "max_tokens", "temperature",
         "max_turns", "max_steps", "max_usd", "api_key",
         "persist", "session_id", "cwd", "permission_mode",
-        "mcp_servers", "agents",
+        "mcp_servers", "agents", "setting_sources",
     }
     extra = {k: v for k, v in opts.items() if k not in consumed}
     if extra:

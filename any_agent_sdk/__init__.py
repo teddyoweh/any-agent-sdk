@@ -74,6 +74,17 @@ from .paths import (
     get_sessions_dir,
     get_session_path,
 )
+from .settings import (
+    KNOWN_SETTING_KEYS,
+    SETTING_SOURCES,
+    apply_settings_to_options,
+    load_setting_source,
+    load_settings,
+    merge_settings,
+    resolve_setting_path,
+    save_setting_source,
+    update_setting_source,
+)
 from .query import (
     APIAssistantMessage,
     APIUserMessage,
