@@ -295,6 +295,16 @@ class Agent:
             kw["base_url"] = self.backend or "http://localhost:8080"
         elif backend_kind == "tgi":
             kw["base_url"] = self.backend or "http://localhost:3000/v1"
+        elif backend_kind == "anthropic_passthrough":
+            # Pass an explicit base_url only when the caller gave us a real
+            # URL (skip the literal ``"anthropic"`` sentinel — letting the
+            # provider use its own default is the whole point of the sentinel).
+            if self.backend and self.backend.lower().startswith(("http://", "https://")):
+                kw["base_url"] = self.backend
+            if self.backend_capability is not None:
+                kw["backend_capability"] = self.backend_capability
+            # api_key is read from $ANTHROPIC_API_KEY inside the provider —
+            # surfacing it here too would shadow that resolution path.
         elif backend_kind == "mock":
             pass  # mock takes its own kwargs from `extra`
         # Best-effort construction — adapters that don't accept some keys

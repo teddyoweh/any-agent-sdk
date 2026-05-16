@@ -63,6 +63,10 @@ _LAZY_PROVIDERS: dict[str, tuple[str, str]] = {
     "llamacpp": ("any_agent_sdk.providers.llamacpp", "LlamaCppProvider"),
     "tgi": ("any_agent_sdk.providers.tgi", "TGIProvider"),
     "modal": ("any_agent_sdk.providers.modal_provider", "ModalProvider"),
+    "anthropic_passthrough": (
+        "any_agent_sdk.providers.anthropic_passthrough",
+        "AnthropicPassthroughProvider",
+    ),
     "mock": ("any_agent_sdk.providers.mock", "MockProvider"),
 }
 
@@ -112,6 +116,13 @@ def detect_provider(model_or_url: str, *, backend_hint: str | None = None) -> st
     s = model_or_url.lower()
     if s == "mock":
         return "mock"
+    # Anthropic passthrough: the literal sentinel ``"anthropic"`` or any
+    # URL on Anthropic's API host. Routed BEFORE the generic URL fallback
+    # so api.anthropic.com doesn't silently pick the OpenAI-compat path
+    # (the wire format is incompatible). Bare ``claude-*`` model names
+    # are deliberately NOT routed here — see routing.py for why.
+    if s == "anthropic" or "api.anthropic.com" in s:
+        return "anthropic_passthrough"
     # Modal serverless: ``modal:workspace/app`` spec form, or any URL on
     # the modal.run host. Checked before the generic URL fallback so a
     # Modal endpoint doesn't silently route to the openai_compat default

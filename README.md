@@ -235,7 +235,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] Mock provider for tests
 - [x] Auto-route from model name shape — no `backend=` needed
 - [x] Modal serverless adapter
-- [ ] Anthropic via separate `anthropic_passthrough` (for parity testing only)
+- [x] Anthropic via separate `anthropic_passthrough` (for parity testing only)
 
 **Tool use**
 - [x] Path A: native via OpenAI-compat `tools[]`

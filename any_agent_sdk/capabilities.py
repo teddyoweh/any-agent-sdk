@@ -530,6 +530,7 @@ BackendKind = Literal[
     "llamacpp",
     "tgi",
     "modal",
+    "anthropic",
     "raw",
     "mock",
 ]
@@ -648,6 +649,14 @@ HOSTED_PROFILES: dict[str, BackendCapability] = {
         supports_grammar=True,
         provider_hint="modal",
     ),
+    "anthropic": BackendCapability(
+        kind="anthropic",
+        supports_native_tools=True,
+        supports_grammar=False,  # Anthropic doesn't expose grammar-constrained sampling
+        supports_logprobs=False,
+        supports_prefix_caching=True,  # implicit prompt caching with cache_control blocks
+        provider_hint="anthropic",
+    ),
     "mock": BackendCapability(
         kind="mock",
         supports_native_tools=True,
@@ -661,6 +670,10 @@ def hosted_profile_from_url(base_url: str) -> BackendCapability | None:
     """Heuristic: match a base_url to a hosted profile."""
 
     url = base_url.lower()
+    if "api.anthropic.com" in url:
+        return HOSTED_PROFILES["anthropic"]
+    if ".modal.run" in url:
+        return HOSTED_PROFILES["modal"]
     if "together" in url:
         return HOSTED_PROFILES["together"]
     if "fireworks" in url:
