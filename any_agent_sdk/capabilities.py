@@ -595,6 +595,12 @@ HOSTED_PROFILES: dict[str, BackendCapability] = {
         supports_grammar=False,
         provider_hint="deepseek",
     ),
+    "moonshot": BackendCapability(
+        kind="openai_compat",
+        supports_native_tools=True,
+        supports_grammar=False,
+        provider_hint="moonshot",
+    ),
     "vllm": BackendCapability(
         kind="openai_compat",
         supports_native_tools=True,
@@ -660,6 +666,8 @@ def hosted_profile_from_url(base_url: str) -> BackendCapability | None:
         return HOSTED_PROFILES["anyscale"]
     if "deepseek" in url:
         return HOSTED_PROFILES["deepseek"]
+    if "moonshot" in url or "kimi" in url:
+        return HOSTED_PROFILES["moonshot"]
     if "11434" in url or "ollama" in url:
         return HOSTED_PROFILES["ollama"]
     if "8080" in url and "llama" in url:

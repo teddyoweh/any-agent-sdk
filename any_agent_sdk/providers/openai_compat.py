@@ -104,6 +104,7 @@ _ENV_KEY_CHAIN: tuple[str, ...] = (
     "DEEPINFRA_API_KEY",
     "CEREBRAS_API_KEY",
     "ANYSCALE_API_KEY",
+    "MOONSHOT_API_KEY",
 )
 
 # Fallback when we can't match a hosted provider — model the most common self-
