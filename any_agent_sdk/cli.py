@@ -60,6 +60,44 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("version", help="Print the SDK version and exit.")
 
+    p_setup = sub.add_parser(
+        "setup-local",
+        help=(
+            "Get a CPU-runnable model installed and verified in <2 minutes. "
+            "Installs Ollama if missing, pulls a curated CPU-friendly model, "
+            "and runs a smoke test."
+        ),
+    )
+    p_setup.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Ollama tag to install (e.g. qwen2.5:1.5b). "
+            "Defaults to the curated recommendation."
+        ),
+    )
+    p_setup.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_models",
+        help="List the curated CPU-friendly models and exit.",
+    )
+    p_setup.add_argument(
+        "--install-ollama",
+        action="store_true",
+        help="Install Ollama via the official script if it's not on PATH.",
+    )
+    p_setup.add_argument(
+        "--skip-smoke-test",
+        action="store_true",
+        help="Skip the post-pull verification request.",
+    )
+    p_setup.add_argument(
+        "--base-url",
+        default="http://localhost:11434",
+        help="Override the Ollama base URL.",
+    )
+
     p_list = sub.add_parser(
         "list-models",
         help=(
@@ -486,12 +524,27 @@ def _build_provider_for_args(args: argparse.Namespace) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def _cmd_setup_local(args: argparse.Namespace) -> int:
+    from .setup_local import print_model_table, run_setup_local  # noqa: PLC0415
+
+    if getattr(args, "list_models", False):
+        print_model_table()
+        return 0
+    return run_setup_local(
+        model=args.model,
+        install_ollama_if_missing=args.install_ollama,
+        skip_smoke_test=args.skip_smoke_test,
+        base_url=args.base_url,
+    )
+
+
 _HANDLERS: dict[str, Any] = {
     "version": _cmd_version,
     "list-models": _cmd_list_models,
     "probe": _cmd_probe,
     "run": _cmd_run,
     "chat": _cmd_chat,
+    "setup-local": _cmd_setup_local,
 }
 
 
