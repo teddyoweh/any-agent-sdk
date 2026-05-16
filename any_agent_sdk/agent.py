@@ -378,6 +378,12 @@ class Agent:
             # Permission check.
             if self.permissions is not None:
                 decision = await check_permission(tool, call.input, self.permissions)
+                # Bridge Claude-shape PermissionResultAllow/Deny returned
+                # from a user-supplied can_use_tool callback to our internal
+                # Allow/Deny structs. Duck-type on .behavior since the Claude
+                # variants are plain dataclasses, not msgspec Structs.
+                decision = _normalize_permission_decision(decision)
+
                 if isinstance(decision, Deny):
                     await self._dispatcher.dispatch(
                         "PermissionDenied",
@@ -394,6 +400,16 @@ class Agent:
                         is_error=True,
                     )
                     continue
+
+                # Allow.updated_input rewrites the tool args before dispatch
+                # — matches Claude SDK PermissionResultAllow semantics. The
+                # ToolUseBlock is frozen, so rebuild with the patched input.
+                if isinstance(decision, Allow) and decision.updated_input is not None:
+                    call = ToolUseBlock(
+                        id=call.id,
+                        name=call.name,
+                        input=decision.updated_input,
+                    )
                 # Ask → in v0 we treat Ask as Allow at the loop layer.
                 # Integrators can convert Ask to Deny via the can_use_tool callback.
 
@@ -636,6 +652,29 @@ class _AssistantAssembler:
             b.json_parts.append(d.partial_json)
             return
         # Unknown delta: ignore for forward-compat.
+
+
+def _normalize_permission_decision(decision: Any) -> Any:
+    """Bridge Claude-shape PermissionResultAllow/Deny → internal Allow/Deny.
+
+    Users passing a ``can_use_tool`` callback via ``ClaudeAgentOptions``
+    typically return Claude SDK's dataclasses (``PermissionResultAllow``
+    /``PermissionResultDeny``). Our ``check_permission`` returns the
+    internal msgspec ``Allow``/``Deny``/``Ask``. This normalizer makes
+    the agent loop indifferent to which shape it got.
+
+    Duck-types on ``.behavior`` so we don't have to import the Claude
+    compat classes here and create a cycle.
+    """
+
+    if isinstance(decision, (Allow, Deny)):
+        return decision
+    behavior = getattr(decision, "behavior", None)
+    if behavior == "allow":
+        return Allow(updated_input=getattr(decision, "updated_input", None))
+    if behavior == "deny":
+        return Deny(reason=getattr(decision, "message", "denied"))
+    return decision
 
 
 def _merge_usage(prev: Usage | None, new: Usage) -> Usage:

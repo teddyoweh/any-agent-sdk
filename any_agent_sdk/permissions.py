@@ -42,7 +42,16 @@ PermissionMode = Literal["default", "auto", "bypass"]
 
 
 class Allow(msgspec.Struct, frozen=True, tag="allow", tag_field="decision"):
-    """Permit the call to proceed."""
+    """Permit the call to proceed.
+
+    ``updated_input`` (optional) rewrites the tool input before dispatch.
+    Matches Claude SDK's ``PermissionResultAllow(updated_input=...)``
+    semantics — a permission callback can sanitize / patch arguments
+    on the way through (e.g. PII redaction, path sandboxing, default
+    injection) without the model knowing.
+    """
+
+    updated_input: dict | None = None
 
 
 class Deny(msgspec.Struct, frozen=True, tag="deny", tag_field="decision"):
