@@ -138,6 +138,8 @@ class Agent:
     _dispatcher: HookDispatcher | None = field(default=None, init=False)
     _budget_tracker: BudgetTracker | None = field(default=None, init=False)
     _provider_hint: str | None = field(default=None, init=False)
+    # AbortSignal-like cancellation event — see __post_init__ for wiring.
+    cancellation_signal: Any = field(default=None, init=False)
     # Permission denials accumulated across the run. Each entry is a
     # ``{tool_name, tool_use_id, tool_input}`` dict matching the Claude
     # SDK's ``SDKPermissionDenial`` shape. ``query()`` reads this after
@@ -194,6 +196,39 @@ class Agent:
         # Provider hint for pricing lookups (e.g. "together", "fireworks").
         if self.backend_capability is not None:
             self._provider_hint = self.backend_capability.provider_hint or None
+
+        # AbortSignal-like cancellation event. Fires when ``Agent.cancel()``
+        # is called. Surfaces on ``ToolPermissionContext.signal`` so
+        # ``can_use_tool`` callbacks (and, post streaming-dispatch rewrite,
+        # tool bodies themselves) can observe the abort and bail.
+        #
+        # Lazy-import to keep top-of-file imports tight; instantiate inside
+        # an event-loop-aware context. anyio.Event() works without a
+        # running loop, so eager init is safe.
+        import anyio  # noqa: PLC0415
+        self.cancellation_signal = anyio.Event()
+
+        # Thread the signal into PermissionContext so check_permission
+        # passes it to the user's can_use_tool callback.
+        if self.permissions is not None and getattr(self.permissions, "signal", None) is None:
+            self.permissions.signal = self.cancellation_signal
+
+    def cancel(self) -> None:
+        """Signal cancellation. Idempotent.
+
+        Fires the agent's ``cancellation_signal`` so any can_use_tool
+        callback inspecting ``ToolPermissionContext.signal`` sees
+        ``signal.is_set() is True`` on the next check. Cooperating tool
+        bodies watching the same event can also observe and bail.
+
+        Currently advisory — the agent loop doesn't yet auto-deny pending
+        tool calls when the signal fires (lands with the streaming-
+        dispatch rewrite). For now, the user wires the deny themselves
+        from inside ``can_use_tool``.
+        """
+
+        if not self.cancellation_signal.is_set():
+            self.cancellation_signal.set()
 
     @staticmethod
     def _has_user_context_message(messages: list[Message]) -> bool:

@@ -517,19 +517,42 @@ class PermissionResultDeny:
     interrupt: bool = False
 
 
-@dataclass(slots=True)
+@dataclass
 class ToolPermissionContext:
     """Drop-in for ``claude_agent_sdk.ToolPermissionContext``.
 
     Third argument passed to a ``can_use_tool`` callback. Carries the
-    session id, optional permission-rule context, and a free-form
-    ``signal`` field for cancellation/interruption (None in our impl
-    until we wire AbortController parity).
+    session id, suggestion hints, and a cancellation ``signal`` —
+    an ``anyio.Event`` that fires when the agent is asked to stop
+    (via ``Agent.cancel()``, budget overrun, ``max_turns`` exceeded,
+    or any future abort path).
+
+    Usage in a permission callback::
+
+        async def can_use_tool(tool_name, tool_input, ctx):
+            if ctx.signal.is_set():
+                return PermissionResultDeny(message="cancelled by user")
+            return PermissionResultAllow()
+
+    The signal is shared across all callbacks for the same agent run,
+    so any cooperating tool implementation that wants to abort early
+    can also do ``await ctx.signal.wait()`` from a background task and
+    bail when it fires. (Tool-context plumbing for in-tool access lands
+    in the streaming-dispatch rewrite — until then this is observable
+    from the permission callback only.)
     """
 
     session_id: str = ""
-    signal: Any = None
+    signal: Any = None  # populated to anyio.Event in __post_init__
     suggestions: list[Any] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        # Lazy-import anyio so importing claude_compat doesn't drag the
+        # whole async runtime when only the dataclass surface is needed
+        # (e.g. type-checking a downstream codebase).
+        if self.signal is None:
+            import anyio
+            self.signal = anyio.Event()
 
 
 class CLIConnectionError(Exception):

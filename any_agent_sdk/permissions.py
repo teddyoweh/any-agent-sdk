@@ -186,6 +186,13 @@ class PermissionContext:
     can_use_tool: CanUseToolFn | None = None
     # Free-form metadata passed to ``can_use_tool`` (session id, etc.).
     extra: dict[str, Any] = field(default_factory=dict)
+    # AbortSignal-like event shared with the agent loop. Fires when the
+    # agent is cancelled, budgets are exhausted, or any abort path
+    # triggers. Surfaces on ``ToolPermissionContext.signal`` for the
+    # user's can_use_tool callback. None means "agent didn't wire one"
+    # — the callback will still receive a fresh, never-fired event so
+    # it can read .signal.is_set() safely.
+    signal: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +248,18 @@ async def check_permission(
             return Ask(prompt=f"rule {hit.pattern!r} requires confirmation")
 
     if ctx.can_use_tool is not None:
-        return await ctx.can_use_tool(tool, input, ctx.extra)
+        # Build a Claude-SDK-shaped ToolPermissionContext for the
+        # callback. The user's can_use_tool wants ``.signal``,
+        # ``.session_id``, and ``.suggestions`` — wrap our internal
+        # PermissionContext.extra (a free-form dict) accordingly.
+        from .claude_compat import ToolPermissionContext  # local to avoid cycle
+
+        tpc = ToolPermissionContext(
+            session_id=str(ctx.extra.get("session_id", "")),
+            signal=ctx.signal,  # __post_init__ mints a fresh Event if None
+            suggestions=list(ctx.extra.get("suggestions", [])),
+        )
+        return await ctx.can_use_tool(tool, input, tpc)
 
     # No callback — use the mode default.
     if ctx.mode == "auto":

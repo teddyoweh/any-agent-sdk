@@ -221,7 +221,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] `create_sdk_mcp_server(name, version, tools=)`
 - [x] `WebFetch` / `WebSearch` built-in tools (Exa-backed)
 - [x] `CLIConnectionError`, `ClaudeSDKError`
-- [ ] `ToolPermissionContext.signal` for cancellation
+- [x] `ToolPermissionContext.signal` for cancellation (`anyio.Event`, fired by `Agent.cancel()`)
 - [ ] `setting_sources` actually loading and persisting per source
 - [ ] Streaming-mode `client.query()` with mid-stream tool dispatch
 
