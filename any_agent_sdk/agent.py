@@ -369,6 +369,14 @@ class Agent:
     async def aclose(self) -> None:
         if self.provider is not None:
             await self.provider.aclose()
+        # Built-in tools (WebSearch/WebFetch) hold a long-lived HTTP client;
+        # close it when the agent shuts down. Safe to call when unused —
+        # lazily-constructed.
+        try:
+            from .builtin_tools import aclose_builtin_clients
+            await aclose_builtin_clients()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
 
     # Async context manager sugar — `async with Agent(...) as a: ...`
     async def __aenter__(self) -> Agent:

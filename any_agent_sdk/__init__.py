@@ -5,6 +5,7 @@ detail and may move between minor versions.
 """
 
 from .agent import Agent
+from .builtin_tools import WebFetch, WebSearch, web_fetch, web_search
 from .capabilities import (
     BackendCapability,
     ModelCapability,
@@ -83,9 +84,13 @@ __all__ = [
     "ToolUsePath",
     "Usage",
     "UserMessage",
+    "WebFetch",
+    "WebSearch",
     "lookup_model",
     "resolve_tool_use_path",
     "tool",
+    "web_fetch",
+    "web_search",
 ]
 
 __version__ = "0.1.0"
