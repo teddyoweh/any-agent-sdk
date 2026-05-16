@@ -1,13 +1,31 @@
 """Sub-agents — orchestration via the tool channel.
 
 A sub-agent is just another tool from the parent's point of view. When the
-parent's model decides to call it, we instantiate a child ``Agent`` with the
-sub-agent's system prompt + tool kit, run it to completion, and surface the
-child's final assistant text as the tool result.
+parent's model decides to call it, we instantiate (or reuse) a child
+``Agent`` with the sub-agent's system prompt + tool kit, run it to
+completion, and surface the child's final assistant text as the tool
+result.
 
 This means the parent's agent loop in ``agent.py`` does **not** need to know
 sub-agents exist — they look like any other ``Tool``. All the orchestration
 lives in this file.
+
+Two ergonomic shapes
+--------------------
+``as_subagent_tool`` accepts **either**:
+
+1. A :class:`SubAgentSpec` — pure declaration; we mint a fresh ``Agent`` per
+   invocation. Good when the sub-agent should start clean every call and
+   you want the registry / provider plumbing handled for you.
+
+2. An already-built :class:`~any_agent_sdk.Agent` instance plus a ``name=``
+   kwarg — we wrap that exact agent. Reuses its provider, tools, system
+   prompt, budget, hooks. Good when the sub-agent has expensive resources
+   (open HTTP pool, MCP servers, custom permissions) that you don't want
+   to re-create per call.
+
+Both paths produce a real :class:`~any_agent_sdk.tools.Tool` that drops
+straight into a :class:`~any_agent_sdk.tools.ToolRegistry`.
 
 Isolation modes
 ---------------
@@ -29,7 +47,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 from .agent import Agent
 from .providers.base import Provider
@@ -116,7 +134,7 @@ class SubAgentTool(Tool):
             fn=self._invoke,  # type: ignore[arg-type]
             # Sub-agents involve LLM calls; serializing same-name invocations
             # is safer than racing them through the parent's tool dispatcher.
-            parallel_safe=False,
+            is_concurrency_safe=False,
         )
         self._spec = spec
         self._parent_provider = parent_provider
@@ -159,19 +177,126 @@ class SubAgentTool(Tool):
         return _extract_final_text(messages)
 
 
+class WrappedAgentTool(Tool):
+    """A ``Tool`` that delegates to an already-instantiated ``Agent``.
+
+    Unlike :class:`SubAgentTool`, this does NOT mint a fresh child per
+    invocation. The wrapped agent's tools, provider, system prompt, budget,
+    hooks, and permissions are reused as-is across calls. The wrapped agent
+    is run with a *fresh, single-turn message list* per invocation so calls
+    don't leak conversational state into each other — but if you genuinely
+    want stateful chained sub-agent calls, pass an ``agent_factory`` to
+    :func:`as_subagent_tool` and capture state yourself.
+
+    Concurrency: same-name parallel dispatch is disabled (``parallel_safe=False``)
+    because a single Agent instance is not safe to run twice concurrently —
+    the provider stream, hook dispatcher, and budget tracker all expect a
+    single in-flight run at a time.
+    """
+
+    __slots__ = ("_agent",)
+
+    def __init__(
+        self,
+        agent: Agent,
+        *,
+        name: str,
+        description: str | None = None,
+    ) -> None:
+        super().__init__(
+            name=name,
+            description=description or f"Delegate to the {name} sub-agent.",
+            input_schema=_spec_to_input_schema(),
+            fn=self._invoke,  # type: ignore[arg-type]
+            is_concurrency_safe=False,
+        )
+        self._agent = agent
+
+    async def _invoke(self, prompt: str) -> str:
+        messages: list[Message] = [UserMessage(content=prompt)]
+        await self._agent.run(messages)
+        return _extract_final_text(messages)
+
+
+# ---------------------------------------------------------------------------
+# Public factory — accepts either shape
+# ---------------------------------------------------------------------------
+
+
+@overload
 def as_subagent_tool(
     spec: SubAgentSpec,
     *,
+    parent_provider: Provider | None = ...,
+) -> Tool: ...
+
+
+@overload
+def as_subagent_tool(
+    agent: Agent,
+    *,
+    name: str,
+    description: str | None = ...,
+) -> Tool: ...
+
+
+def as_subagent_tool(
+    spec_or_agent: SubAgentSpec | Agent,
+    *,
+    name: str | None = None,
+    description: str | None = None,
     parent_provider: Provider | None = None,
 ) -> Tool:
-    """Turn a ``SubAgentSpec`` into a ``Tool`` the parent agent can register.
+    """Turn a :class:`SubAgentSpec` (or an already-built :class:`Agent`) into
+    a :class:`~any_agent_sdk.tools.Tool` the parent agent can register.
 
-    ``parent_provider`` is optional but recommended in asyncio_task mode —
-    passing the parent's provider lets the child reuse the open HTTP client
-    pool, which is the dominant perf win for in-process sub-agents.
+    Two shapes:
+
+    * ``as_subagent_tool(spec)`` — declaration form. We mint a fresh
+      :class:`Agent` per invocation using the spec's model + system prompt
+      + tools. Pass ``parent_provider=`` to share an HTTP pool with the
+      parent (recommended in ``asyncio_task`` mode).
+
+    * ``as_subagent_tool(agent, name="research", description="...")`` —
+      wrap an existing :class:`Agent` instance directly. Reuses the agent's
+      provider, tools, system, budget, hooks. ``name`` is what the parent
+      model sees and calls; ``description`` defaults to a generic line.
+
+    Raises
+    ------
+    TypeError
+        If the first argument is neither a :class:`SubAgentSpec` nor an
+        :class:`Agent`, or if an ``Agent`` is passed without ``name``.
     """
 
-    return SubAgentTool(spec, parent_provider=parent_provider)
+    if isinstance(spec_or_agent, SubAgentSpec):
+        if name is not None or description is not None:
+            raise TypeError(
+                "as_subagent_tool(SubAgentSpec) — pass name/description via "
+                "the spec, not as kwargs."
+            )
+        return SubAgentTool(spec_or_agent, parent_provider=parent_provider)
+
+    if isinstance(spec_or_agent, Agent):
+        if not name:
+            raise TypeError(
+                "as_subagent_tool(Agent, name='...') requires an explicit "
+                "name kwarg — the wrapped agent has no externally-visible "
+                "identifier of its own."
+            )
+        if parent_provider is not None:
+            raise TypeError(
+                "as_subagent_tool(Agent) does not take parent_provider — "
+                "the wrapped agent already owns its provider."
+            )
+        return WrappedAgentTool(
+            spec_or_agent, name=name, description=description
+        )
+
+    raise TypeError(
+        f"as_subagent_tool: first argument must be SubAgentSpec or Agent, "
+        f"got {type(spec_or_agent).__name__}"
+    )
 
 
 # ---------------------------------------------------------------------------

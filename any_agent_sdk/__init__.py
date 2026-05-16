@@ -123,6 +123,13 @@ from .transcripts import (
     iter_transcripts,
     read_transcript,
 )
+from .subagent import (
+    IsolationMode,
+    SubAgentSpec,
+    SubAgentTool,
+    WrappedAgentTool,
+    as_subagent_tool,
+)
 from .tools import Tool, ToolRegistry, tool
 from .types import (
     AssistantMessage,
@@ -180,6 +187,8 @@ __all__ = [
     "SDKUserMessage",
     "StreamEvent",
     "StreamProtocolError",
+    "SubAgentSpec",
+    "SubAgentTool",
     "SystemMessage",
     "TextBlock",
     "TextDelta",
@@ -197,6 +206,8 @@ __all__ = [
     "UserMessage",
     "WebFetch",
     "WebSearch",
+    "WrappedAgentTool",
+    "as_subagent_tool",
     "lookup_model",
     "query",
     "resolve_tool_use_path",

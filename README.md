@@ -291,7 +291,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] `system_prompt.py`
 - [ ] `fireworks_hosted.py` runs against live Fireworks
 - [ ] `vllm_self_hosted.py` runs against live vLLM
-- [ ] `multi_agent_research.py` end-to-end with sub-agents
+- [x] `multi_agent_research.py` end-to-end with sub-agents
 
 **1.0 prerequisites**
 - [ ] Streaming tool dispatch rewrite
