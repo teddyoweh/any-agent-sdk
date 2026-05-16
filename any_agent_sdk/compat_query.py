@@ -217,9 +217,13 @@ def _build_agent(opts: dict[str, Any]) -> Agent:
     model = opts.get("model") or os.environ.get(
         "ANY_AGENT_MODEL", "qwen2.5-7b-instruct"
     )
-    backend = opts.get("backend") or os.environ.get(
-        "ANY_AGENT_BASE_URL", "http://localhost:11434"
-    )
+    # Auto-route from model name when no backend was passed. Precedence:
+    # explicit ``backend=`` > ``$ANY_AGENT_BASE_URL`` > shape-based
+    # inference > Ollama default. This is what makes
+    # ``ClaudeAgentOptions(model="qwen2.5:7b")`` work with no extra
+    # kwarg — same two-line drop-in story as the Claude SDK.
+    from .routing import resolve_backend
+    backend = resolve_backend(model, opts.get("backend"))
 
     # Tool registry from Tool instances; built-in name strings are stashed.
     registry = ToolRegistry()
