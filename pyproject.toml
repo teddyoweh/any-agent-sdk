@@ -1,14 +1,35 @@
 [project]
 name = "any-agent-sdk"
-version = "0.0.1"
+version = "1.0.0"
 description = "Drop-in open-source agent SDK. Multi-model, streaming, MCP, sub-agents."
+readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
+authors = [{ name = "any-agent-sdk authors" }]
+keywords = ["agent", "llm", "claude", "ollama", "mcp", "tool-use", "streaming"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
 dependencies = [
     "msgspec>=0.18.6",
     "httpx[http2]>=0.27",
     "anyio>=4.4",
 ]
+
+[project.urls]
+Homepage = "https://github.com/teddyoweh/any-agent-sdk"
+Repository = "https://github.com/teddyoweh/any-agent-sdk"
+Issues = "https://github.com/teddyoweh/any-agent-sdk/issues"
+Changelog = "https://github.com/teddyoweh/any-agent-sdk/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 anthropic = []  # uses httpx directly, no SDK dep
@@ -21,6 +42,8 @@ dev = [
     "pytest-anyio>=0.0",
     "ruff>=0.5",
     "respx>=0.21",
+    "build>=1.2",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 docs = [
     "mkdocs>=1.6",
@@ -34,6 +57,22 @@ any-agent = "any_agent_sdk.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["any_agent_sdk"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/any_agent_sdk",
+    "/tests",
+    "/docs",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+    "/SEMVER.md",
+    "/RELEASING.md",
+    "/pyproject.toml",
+]
 
 [tool.ruff]
 line-length = 100

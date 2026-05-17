@@ -298,7 +298,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] Mid-stream cancellation via `ToolPermissionContext.signal`
 - [x] All 16 examples verified against ≥ 3 backends
 - [x] Docs site (mkdocs-material)
-- [ ] PyPI 1.0 release with semver guarantee
+- [x] PyPI 1.0 release with semver guarantee
 
 ---
 

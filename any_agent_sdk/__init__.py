@@ -1,7 +1,9 @@
 """any-agent-sdk — Claude Code for open-source models.
 
-Public surface is intentionally tiny. Everything else is implementation
-detail and may move between minor versions.
+The semver-stable public API is the set of names exported in ``__all__``.
+Anything else (including names imported at the top of this module but not
+listed in ``__all__``) is implementation detail and may change between
+minor releases. See ``SEMVER.md`` for the full policy.
 """
 
 from .agent import Agent
@@ -145,28 +147,86 @@ from .types import (
     UserMessage,
 )
 
+# --- public, semver-stable API surface (1.0.0+) -----------------------------
+# Everything below is covered by the SemVer guarantee in SEMVER.md.
+# Symbols imported above but NOT listed here are implementation detail.
 __all__ = [
+    # Core
     "Agent",
-    "AgentError",
-    "AssistantMessage",
-    "AuthError",
+    "query",
+    "tool",
+    # Tools
+    "Tool",
+    "ToolRegistry",
+    "WebFetch",
+    "WebSearch",
+    "web_fetch",
+    "web_search",
+    # Sub-agents
+    "AgentDefinition",
+    "IsolationMode",
+    "SubAgentSpec",
+    "SubAgentTool",
+    "WrappedAgentTool",
+    "as_subagent_tool",
+    # Capabilities / routing
     "BackendCapability",
-    "BudgetExceededError",
+    "ModelCapability",
+    "ToolUsePath",
+    "lookup_model",
+    "resolve_tool_use_path",
+    # Plugins
+    "Plugin",
+    # Messages — internal flat shapes
+    "AssistantMessage",
     "ContentBlock",
+    "Message",
+    "ModelUsage",
+    "TextBlock",
+    "ThinkingBlock",
+    "ToolResultBlock",
+    "ToolUseBlock",
+    "Usage",
+    "UserMessage",
+    "SystemMessage",
+    # Messages — Claude SDK parity shapes
+    "APIAssistantMessage",
+    "APIUserMessage",
+    "SDKAssistantMessage",
+    "SDKCompactBoundaryMessage",
+    "SDKMessage",
+    "SDKPermissionDenial",
+    "SDKResultMessage",
+    "SDKStatusMessage",
+    "SDKSystemMessage",
+    "SDKUserMessage",
+    "ResultMessage",
+    # Streaming events
     "ContentBlockDelta",
     "ContentBlockStart",
     "ContentBlockStop",
     "InputJsonDelta",
-    "Message",
     "MessageDelta",
     "MessageStart",
     "MessageStop",
-    "ModelCapability",
-    "ModelUsage",
-    "PermissionDeniedError",
-    "Plugin",
-    "ProviderError",
-    "RateLimitError",
+    "StreamEvent",
+    "TextDelta",
+    "ThinkingDelta",
+    # Claude SDK parity entry points
+    "ClaudeAgentOptions",
+    "ClaudeSDKClient",
+    "ClaudeSDKError",
+    "CLIConnectionError",
+    "HookMatcher",
+    "HookInput",
+    "HookJSONOutput",
+    "ClaudeHookContext",
+    "ClaudePermissionResult",
+    "PermissionResultAllow",
+    "PermissionResultDeny",
+    "ToolPermissionContext",
+    "create_sdk_mcp_server",
+    # Sessions
     "Checkpoint",
     "InMemorySessionStore",
     "Session",
@@ -177,43 +237,34 @@ __all__ = [
     "fork_session",
     "make_checkpoints",
     "resume_session",
-    "SDKAssistantMessage",
-    "SDKCompactBoundaryMessage",
-    "SDKMessage",
-    "SDKPermissionDenial",
-    "SDKResultMessage",
-    "SDKStatusMessage",
-    "SDKSystemMessage",
-    "SDKUserMessage",
-    "StreamEvent",
+    # Errors
+    "AgentError",
+    "AuthError",
+    "BudgetExceededError",
+    "PermissionDeniedError",
+    "ProviderError",
+    "RateLimitError",
     "StreamProtocolError",
-    "SubAgentSpec",
-    "SubAgentTool",
-    "SystemMessage",
-    "TextBlock",
-    "TextDelta",
-    "ThinkingBlock",
-    "ThinkingDelta",
-    "Tool",
     "ToolExecutionError",
-    "ToolRegistry",
-    "ToolResultBlock",
-    "ToolUseBlock",
-    "ToolUsePath",
-    "APIAssistantMessage",
-    "APIUserMessage",
-    "Usage",
-    "UserMessage",
-    "WebFetch",
-    "WebSearch",
-    "WrappedAgentTool",
-    "as_subagent_tool",
-    "lookup_model",
-    "query",
-    "resolve_tool_use_path",
-    "tool",
-    "web_fetch",
-    "web_search",
+    # Version
+    "__version__",
 ]
 
-__version__ = "0.1.0"
+
+def _detect_version() -> str:
+    """Single-source the version from installed package metadata.
+
+    Falls back to a literal so import still works in editable / unbuilt
+    checkouts where metadata may be stale. The release workflow always
+    builds from pyproject.toml so the published wheel reports the
+    correct version through importlib.metadata.
+    """
+    try:
+        from importlib.metadata import PackageNotFoundError, version  # type: ignore[attr-defined]
+
+        return version("any-agent-sdk")
+    except Exception:  # pragma: no cover - extremely defensive
+        return "1.0.0"
+
+
+__version__ = _detect_version()
