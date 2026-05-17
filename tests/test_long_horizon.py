@@ -30,7 +30,9 @@ any particular model's compliance.
 
 from __future__ import annotations
 
+import gc
 import logging
+import tracemalloc
 
 import anyio
 import pytest
@@ -355,5 +357,163 @@ def test_max_turns_zero_no_provider_call():
         assert len(non_meta) == 1
         assert isinstance(non_meta[0], UserMessage)
         assert call_count["n"] == 0
+
+    anyio.run(main)
+
+
+# ---------------------------------------------------------------------------
+# Memory-growth leak detector.
+# ---------------------------------------------------------------------------
+
+
+# Per-turn allocation ceiling. The agent loop *legitimately* allocates per
+# turn (one new AssistantMessage + ~one UserMessage with a ToolResultBlock
+# + transient stream events + executor task state). On CPython 3.12 this
+# settles around 2-6 KB / turn on the CounterMock script — well under the
+# ceiling. The ceiling exists to fail loudly if a future change starts
+# retaining transient per-turn state (closed-stream events, finished
+# executor results, dead hook contexts, etc.) inside the agent or its
+# subsystems. Bump the ceiling only if a *deliberate* change widens the
+# per-turn working set and the new value is still O(1) in turn count.
+_PER_TURN_BYTES_CEILING = 32 * 1024  # 32 KB / turn
+
+# We measure across the *second half* of the run, after JIT-like warmups
+# (anyio task scheduler, msgspec decoder caches, logger handler buffers)
+# have settled. Comparing the per-turn delta across two windows in the
+# stable region is what actually catches O(n^2) growth — comparing
+# absolute total memory at one snapshot doesn't distinguish "constant
+# per-turn cost" from "growing per-turn cost".
+_LEAK_TURNS = 120
+_WARMUP_TURNS = 20  # ignore the first N turns; only assert on steady state
+
+
+def test_per_turn_memory_growth_is_bounded():
+    """Drive a 120-turn loop and snapshot allocations every 20 turns. The
+    per-turn average across the warmed-up window must stay under
+    ``_PER_TURN_BYTES_CEILING`` AND must not be drifting upward turn over
+    turn — both signals of a real leak.
+
+    Why this test exists
+    --------------------
+    The pre-PR ``max_steps=20`` cap meant nobody actually ran the loop
+    long enough for accumulating per-turn state to matter. Now that the
+    default is unlimited, anyone using the agent for a real long-horizon
+    task (research swarms, multi-day pipelines, autonomous bounty
+    hunters) needs assurance that turn 1,000 doesn't cost 50× turn 1 in
+    RAM. This test fails loudly the moment a regression starts retaining
+    transient per-turn state — closed stream events, finished executor
+    coroutines, dead hook contexts, etc.
+
+    What we measure
+    ---------------
+    ``tracemalloc.get_traced_memory()[0]`` between turn checkpoints. We
+    compare the average per-turn growth in two contiguous windows of the
+    steady-state region. If the second window's per-turn growth is more
+    than 2× the first window's, the loop is allocating more per turn the
+    longer it runs — a leak. Some noise is expected (anyio task pool
+    churn, dict resizing), hence the 2× headroom.
+    """
+
+    async def main():
+        # Force a clean baseline so unrelated allocations from other tests
+        # don't show up in the windows we compare.
+        gc.collect()
+        tracemalloc.start()
+        baseline = tracemalloc.get_traced_memory()[0]
+
+        agent = Agent(
+            model="mock-7b",
+            provider=CounterMock(_LEAK_TURNS),
+            tools=[increment_counter],
+        )
+
+        messages: list = [UserMessage(content="count")]
+        # (turn_number, traced_memory_bytes) checkpoints every 20 turns.
+        # Captured AFTER gc.collect so we measure live retained bytes,
+        # not transient cycles waiting to be reclaimed.
+        snapshots: list[tuple[int, int]] = []
+        turn = 0
+
+        try:
+            async for yielded in agent.run_iter(messages):
+                if isinstance(yielded, AssistantMessage):
+                    turn += 1
+                    if turn % 20 == 0:
+                        gc.collect()
+                        snapshots.append((turn, tracemalloc.get_traced_memory()[0]))
+        finally:
+            await agent.aclose()
+            tracemalloc.stop()
+
+        assert turn == _LEAK_TURNS, f"expected {_LEAK_TURNS} turns, got {turn}"
+        # Six checkpoints: 20, 40, 60, 80, 100, 120.
+        assert len(snapshots) == _LEAK_TURNS // 20
+
+        # Sanity: agent's own internal retention should be empty / minimal
+        # after the run. These are the obvious leak buckets to audit
+        # first if this test ever fires in CI.
+        assert agent._permission_denials == [], (
+            "permission_denials accumulated despite no denials: "
+            f"{agent._permission_denials}"
+        )
+        assert not agent.cancellation_signal.is_set(), (
+            "cancellation_signal fired unexpectedly during clean run"
+        )
+
+        # Conversation list grew linearly: every assistant turn produces
+        # 1 (final) or 2 (tool-using) messages. For our script that's
+        # 2 * _LEAK_TURNS total + 1 original user prompt - 1 (the final
+        # turn has no tool_result), or simply 2 * _LEAK_TURNS.
+        non_meta = [m for m in messages if not getattr(m, "isMeta", False)]
+        assert len(non_meta) == 2 * _LEAK_TURNS, (
+            f"messages list shape wrong: got {len(non_meta)}, expected {2 * _LEAK_TURNS}"
+        )
+
+        # ------------------------------------------------------------------
+        # Memory growth analysis — the actual leak check.
+        # ------------------------------------------------------------------
+        warmup_idx = _WARMUP_TURNS // 20  # snapshot index where warmup ends
+        # First post-warmup window: snapshots[warmup_idx] → middle
+        # Second window: middle → end
+        post_warmup = snapshots[warmup_idx:]
+        mid = len(post_warmup) // 2
+        assert mid >= 1, (
+            "not enough post-warmup snapshots to split into two windows — "
+            "increase _LEAK_TURNS or lower _WARMUP_TURNS"
+        )
+
+        def per_turn_growth(window: list[tuple[int, int]]) -> float:
+            """Bytes allocated per turn across the window, averaged."""
+
+            turns_span = window[-1][0] - window[0][0]
+            bytes_span = window[-1][1] - window[0][1]
+            return bytes_span / turns_span
+
+        first_window = post_warmup[: mid + 1]
+        second_window = post_warmup[mid:]
+        first = per_turn_growth(first_window)
+        second = per_turn_growth(second_window)
+
+        # Absolute ceiling — even the first window must be sane.
+        assert first < _PER_TURN_BYTES_CEILING, (
+            f"per-turn allocation already over ceiling in first window: "
+            f"{first:.0f} B/turn > {_PER_TURN_BYTES_CEILING} B/turn"
+        )
+        assert second < _PER_TURN_BYTES_CEILING, (
+            f"per-turn allocation over ceiling in second window: "
+            f"{second:.0f} B/turn > {_PER_TURN_BYTES_CEILING} B/turn"
+        )
+
+        # The leak signal — second window must not be meaningfully larger
+        # than the first. 2× headroom for measurement noise + GC timing.
+        # On a real leak (O(n^2) retention) second/first balloons quickly
+        # because the second window's *turns* are accumulating against an
+        # ever-growing baseline.
+        ratio = second / max(first, 1.0)  # guard div-by-zero on tiny first
+        assert ratio < 2.0, (
+            f"per-turn growth drifting upward (leak suspect): "
+            f"first window {first:.0f} B/turn, second window {second:.0f} B/turn, "
+            f"ratio {ratio:.2f}x (ceiling 2.0x). Full snapshots: {snapshots}"
+        )
 
     anyio.run(main)
