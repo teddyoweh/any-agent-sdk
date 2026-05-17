@@ -21,6 +21,8 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ __all__ = [
     "DEFAULT_RECOMMENDATION",
     "is_ollama_installed",
     "is_ollama_running",
+    "start_ollama_server",
     "install_ollama",
     "pull_model",
     "smoke_test",
@@ -209,6 +212,74 @@ def is_ollama_running(base_url: str = "http://localhost:11434") -> bool:
         return False
 
 
+def start_ollama_server(
+    *,
+    base_url: str = "http://localhost:11434",
+    timeout_s: float = 15.0,
+    log_path: str | None = None,
+) -> tuple[bool, str | None]:
+    """Spawn ``ollama serve`` in the background and wait for it to answer.
+
+    Returns ``(ok, log_path)``. If ollama is already running, returns
+    ``(True, None)`` without spawning anything. If ollama is not on PATH,
+    returns ``(False, None)``. On failure to come up within ``timeout_s``,
+    returns ``(False, log_path)`` so callers can surface the captured log.
+
+    The server is spawned **detached** from this process group so that the
+    Python process exiting (e.g. ``setup-local`` finishing) does not kill
+    the daemon the user is about to use. Stdout/stderr are tee'd to
+    ``log_path`` (a tempfile by default) so the user can read what went
+    wrong if the spawn fails.
+    """
+
+    if is_ollama_running(base_url):
+        return True, None
+
+    if not is_ollama_installed():
+        return False, None
+
+    if log_path is None:
+        fd, log_path = tempfile.mkstemp(prefix="any-agent-ollama-", suffix=".log")
+        os.close(fd)
+
+    # Detach so the daemon outlives this Python process. On POSIX we use
+    # ``start_new_session`` (its own process group + session leader). On
+    # Windows we use ``DETACHED_PROCESS`` + ``CREATE_NEW_PROCESS_GROUP``.
+    popen_kwargs: dict[str, object] = {
+        "stdout": open(log_path, "ab"),
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if sys.platform.startswith("win"):
+        # CREATE_NEW_PROCESS_GROUP = 0x00000200, DETACHED_PROCESS = 0x00000008
+        popen_kwargs["creationflags"] = 0x00000200 | 0x00000008
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    try:
+        subprocess.Popen(["ollama", "serve"], **popen_kwargs)  # noqa: S603
+    except (OSError, ValueError) as e:
+        # Best-effort: stash the error so the caller can surface it.
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[any-agent] failed to spawn `ollama serve`: {e}\n")
+        except OSError:
+            pass
+        return False, log_path
+
+    # Poll until the server answers or we hit the deadline. We sleep in
+    # small slices so a fast cold-start (~1s on warm caches) doesn't pay
+    # the full timeout.
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if is_ollama_running(base_url):
+            return True, log_path
+        time.sleep(0.4)
+
+    return False, log_path
+
+
 # ---------------------------------------------------------------------------
 # Install + pull
 # ---------------------------------------------------------------------------
@@ -306,8 +377,18 @@ def run_setup_local(
     install_ollama_if_missing: bool = False,
     skip_smoke_test: bool = False,
     base_url: str = "http://localhost:11434",
+    auto_start_server: bool = True,
+    start_timeout_s: float = 15.0,
 ) -> int:
-    """End-to-end: install Ollama if needed → pull the model → smoke test."""
+    """End-to-end: install Ollama if needed → pull the model → smoke test.
+
+    By default this command will also **start the Ollama server itself**
+    when ollama is installed but the daemon isn't running yet. The whole
+    point of ``setup-local`` is to get the user from zero to a working
+    model with one command; making them go run ``ollama serve`` in a
+    second terminal defeats the purpose. Pass ``auto_start_server=False``
+    (CLI: ``--no-auto-start-server``) if you'd rather keep that behavior.
+    """
 
     if not is_ollama_installed():
         if not install_ollama_if_missing:
@@ -319,9 +400,30 @@ def run_setup_local(
             return rc
 
     if not is_ollama_running(base_url):
-        print(f"Ollama server not responding at {base_url}.")
-        print("Start it with: `ollama serve` (or restart the Ollama app).")
-        return 1
+        if not auto_start_server:
+            print(f"Ollama server not responding at {base_url}.")
+            print("Start it with: `ollama serve` (or restart the Ollama app).")
+            return 1
+
+        print(f"Ollama server not running at {base_url} — starting it now …")
+        ok, log_path = start_ollama_server(
+            base_url=base_url, timeout_s=start_timeout_s
+        )
+        if ok:
+            print("  ollama serve is up.")
+        else:
+            print(
+                f"Failed to start `ollama serve` within {start_timeout_s:.0f}s.",
+                file=sys.stderr,
+            )
+            if log_path:
+                print(f"  server log: {log_path}", file=sys.stderr)
+            print(
+                "  Start it manually with `ollama serve` (or restart the Ollama app), "
+                "then re-run `any-agent setup-local`.",
+                file=sys.stderr,
+            )
+            return 1
 
     tag = model or DEFAULT_RECOMMENDATION
     # Validate the tag against our curated list when the user passed one,

@@ -21,6 +21,8 @@ from any_agent_sdk.setup_local import (
     is_ollama_installed,
     is_ollama_running,
     print_model_table,
+    run_setup_local,
+    start_ollama_server,
 )
 
 
@@ -123,3 +125,173 @@ def test_setup_local_list_dispatches_through_main(
     out = capsys.readouterr().out
     assert rc == 0
     assert DEFAULT_RECOMMENDATION in out
+
+
+# ---------------------------------------------------------------------------
+# Auto-start `ollama serve` when the daemon isn't running
+# ---------------------------------------------------------------------------
+
+
+def test_start_ollama_server_short_circuits_when_already_running() -> None:
+    """If the daemon already answers, we must not spawn a second one."""
+
+    with patch(
+        "any_agent_sdk.setup_local.is_ollama_running", return_value=True
+    ) as running, patch(
+        "any_agent_sdk.setup_local.subprocess.Popen"
+    ) as popen:
+        ok, log_path = start_ollama_server()
+    assert ok is True
+    assert log_path is None
+    assert running.called
+    popen.assert_not_called()
+
+
+def test_start_ollama_server_returns_false_when_not_installed() -> None:
+    """No ollama on PATH → can't start it. Don't try."""
+
+    with patch(
+        "any_agent_sdk.setup_local.is_ollama_running", return_value=False
+    ), patch(
+        "any_agent_sdk.setup_local.is_ollama_installed", return_value=False
+    ), patch(
+        "any_agent_sdk.setup_local.subprocess.Popen"
+    ) as popen:
+        ok, log_path = start_ollama_server()
+    assert ok is False
+    assert log_path is None
+    popen.assert_not_called()
+
+
+def test_start_ollama_server_spawns_and_polls_until_ready() -> None:
+    """When ollama is installed but down, spawn `ollama serve` and wait."""
+
+    # First two probes return False (still booting), third returns True.
+    probes = iter([False, False, True])
+
+    def fake_running(*_a: object, **_k: object) -> bool:
+        return next(probes)
+
+    with patch(
+        "any_agent_sdk.setup_local.is_ollama_installed", return_value=True
+    ), patch(
+        "any_agent_sdk.setup_local.is_ollama_running", side_effect=fake_running
+    ), patch(
+        "any_agent_sdk.setup_local.subprocess.Popen"
+    ) as popen, patch(
+        "any_agent_sdk.setup_local.time.sleep"  # don't actually sleep in tests
+    ):
+        ok, log_path = start_ollama_server(timeout_s=5.0)
+
+    assert ok is True
+    assert log_path is not None
+    assert popen.call_count == 1
+    # We MUST detach the daemon — otherwise it dies when the user's
+    # `any-agent setup-local` process exits.
+    _, kwargs = popen.call_args
+    if "start_new_session" in kwargs:
+        assert kwargs["start_new_session"] is True
+    elif "creationflags" in kwargs:
+        # Windows: must request a new process group + detached
+        assert kwargs["creationflags"] != 0
+
+
+def test_start_ollama_server_times_out_cleanly() -> None:
+    """If the daemon never answers, return False — don't hang forever."""
+
+    with patch(
+        "any_agent_sdk.setup_local.is_ollama_installed", return_value=True
+    ), patch(
+        "any_agent_sdk.setup_local.is_ollama_running", return_value=False
+    ), patch(
+        "any_agent_sdk.setup_local.subprocess.Popen"
+    ), patch(
+        "any_agent_sdk.setup_local.time.sleep"
+    ):
+        ok, log_path = start_ollama_server(timeout_s=0.1)
+
+    assert ok is False
+    assert log_path is not None  # caller can read the captured server log
+
+
+def test_run_setup_local_auto_starts_server_by_default() -> None:
+    """The whole point of `setup-local`: don't punt to the user — start
+    `ollama serve` ourselves when it's installed but not running."""
+
+    with patch(
+        "any_agent_sdk.setup_local.is_ollama_installed", return_value=True
+    ), patch(
+        "any_agent_sdk.setup_local.is_ollama_running", return_value=False
+    ), patch(
+        "any_agent_sdk.setup_local.start_ollama_server",
+        return_value=(True, "/tmp/ollama.log"),
+    ) as starter, patch(
+        "any_agent_sdk.setup_local.pull_model", return_value=0
+    ), patch(
+        "any_agent_sdk.setup_local.smoke_test", return_value=True
+    ):
+        rc = run_setup_local(skip_smoke_test=True)
+
+    assert rc == 0
+    starter.assert_called_once()
+
+
+def test_run_setup_local_can_opt_out_of_auto_start(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`auto_start_server=False` preserves the old behavior: just say
+    'go run ollama serve' and exit 1."""
+
+    with patch(
+        "any_agent_sdk.setup_local.is_ollama_installed", return_value=True
+    ), patch(
+        "any_agent_sdk.setup_local.is_ollama_running", return_value=False
+    ), patch(
+        "any_agent_sdk.setup_local.start_ollama_server"
+    ) as starter:
+        rc = run_setup_local(auto_start_server=False)
+
+    assert rc == 1
+    starter.assert_not_called()
+    out = capsys.readouterr().out
+    assert "ollama serve" in out
+
+
+def test_run_setup_local_reports_when_auto_start_fails(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """If auto-start fails, surface the captured log path so the user can
+    actually debug — don't just say 'failed'."""
+
+    with patch(
+        "any_agent_sdk.setup_local.is_ollama_installed", return_value=True
+    ), patch(
+        "any_agent_sdk.setup_local.is_ollama_running", return_value=False
+    ), patch(
+        "any_agent_sdk.setup_local.start_ollama_server",
+        return_value=(False, "/tmp/ollama-fail.log"),
+    ):
+        rc = run_setup_local()
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "/tmp/ollama-fail.log" in err
+
+
+def test_cli_no_auto_start_server_flag_parses() -> None:
+    """The CLI must expose the opt-out flag and forward it correctly."""
+
+    parser = cli._build_parser()
+    args = parser.parse_args(["setup-local", "--no-auto-start-server"])
+    assert args.auto_start_server is False
+
+    args_default = parser.parse_args(["setup-local"])
+    assert args_default.auto_start_server is True
+
+
+def test_cli_start_timeout_flag_parses() -> None:
+    """`--start-timeout 30` should land in args as start_timeout_s=30.0."""
+
+    parser = cli._build_parser()
+    args = parser.parse_args(["setup-local", "--start-timeout", "30"])
+    assert args.start_timeout_s == 30.0
