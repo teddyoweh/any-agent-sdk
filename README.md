@@ -295,7 +295,7 @@ What's shipped — and what's still ahead. Check our progress.
 
 **1.0 prerequisites**
 - [ ] Streaming tool dispatch rewrite
-- [ ] Mid-stream cancellation via `ToolPermissionContext.signal`
+- [x] Mid-stream cancellation via `ToolPermissionContext.signal`
 - [ ] All 16 examples verified against ≥ 3 backends
 - [ ] Docs site (mkdocs-material)
 - [ ] PyPI 1.0 release with semver guarantee

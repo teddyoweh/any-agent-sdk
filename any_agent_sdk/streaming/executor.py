@@ -155,6 +155,9 @@ class StreamingToolExecutor:
         "_tg",
         "_scopes",
         "_aborted",
+        "_signal_cancelled",
+        "_cancellation_signal",
+        "_watcher_scope",
         "_closed",
     )
 
@@ -164,6 +167,7 @@ class StreamingToolExecutor:
         *,
         max_concurrency: int | None = None,
         can_use_tool: CanUseToolFn | None = None,
+        cancellation_signal: "anyio.Event | None" = None,
     ) -> None:
         self._registry = registry
         self._can_use_tool = can_use_tool
@@ -187,6 +191,21 @@ class StreamingToolExecutor:
         # in-flight task at once. Indexed in insertion order.
         self._scopes: list[anyio.CancelScope] = []
         self._aborted = False
+        # Distinct from ``_aborted``: that flag covers
+        # ``abort_siblings_on_error`` (one tool crashed, kill the rest).
+        # ``_signal_cancelled`` covers external cancellation via the
+        # cancellation_signal Event (``Agent.cancel()``, budget overrun,
+        # any future abort path). They produce different
+        # ToolResultBlock messages so callers can distinguish.
+        self._signal_cancelled = False
+        # Shared event the agent fires to cancel the whole run. We
+        # observe it via a watcher task started in ``__aenter__``; when
+        # it fires we mark ``_signal_cancelled`` and cancel every
+        # per-task CancelScope so in-flight tools die fast.
+        self._cancellation_signal = cancellation_signal
+        # Scope wrapping the watcher task so ``__aexit__`` can wake it
+        # up when the executor closes cleanly (signal never fired).
+        self._watcher_scope: anyio.CancelScope | None = None
         self._closed = False
 
     # ------------------------------------------------------------------
@@ -199,12 +218,36 @@ class StreamingToolExecutor:
         # ``add_tool_call`` can ``start_soon`` into it across the lifetime.
         self._tg = anyio.create_task_group()
         await self._tg.__aenter__()
+        # Wire cancellation_signal handling. Two cases:
+        #   1. Signal is already set (caller fired ``cancel()`` BEFORE
+        #      entering this executor). Mark ourselves cancelled now so
+        #      ``add_tool_call`` short-circuits every call — no watcher
+        #      needed.
+        #   2. Signal is not set. Spawn a watcher task in the executor's
+        #      task group that awaits the signal. When it fires, we
+        #      cancel every in-flight per-task scope and mark
+        #      ``_signal_cancelled`` so future ``add_tool_call``s
+        #      short-circuit too. The watcher lives in its own
+        #      ``CancelScope`` so ``__aexit__`` can wake it on clean
+        #      shutdown (signal never fired).
+        if self._cancellation_signal is not None:
+            if self._cancellation_signal.is_set():
+                self._signal_cancelled = True
+            else:
+                self._watcher_scope = anyio.CancelScope()
+                self._tg.start_soon(self._watch_cancellation_signal)
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         self._closed = True
         # Closing the task group joins all in-flight tasks.
         assert self._tg is not None
+        # Wake the watcher if it's still parked on the Event. Doing this
+        # before joining the task group prevents the task group's
+        # ``__aexit__`` from blocking forever on a watcher that never
+        # observed the signal during this run.
+        if self._watcher_scope is not None:
+            self._watcher_scope.cancel()
         unwrap_exc: BaseException | None = None
         try:
             await self._tg.__aexit__(exc_type, exc, tb)
@@ -227,12 +270,17 @@ class StreamingToolExecutor:
         finally:
             # Fill any leftover None slots — shouldn't happen if the TG joined
             # cleanly, but a stray cancellation could leave a hole.
+            fallback_reason = (
+                "cancelled by signal"
+                if self._signal_cancelled
+                else "tool execution cancelled"
+            )
             for i, r in enumerate(self._results):
                 if r is None:
                     call = self._calls[i]
                     self._results[i] = ToolResultBlock(
                         tool_use_id=call.id,
-                        content="tool execution cancelled",
+                        content=fallback_reason,
                         is_error=True,
                     )
             # Releases any wait_all() blocked on us.
@@ -241,6 +289,33 @@ class StreamingToolExecutor:
                 self._idle_event.set()
         if unwrap_exc is not None:
             raise unwrap_exc
+
+    async def _watch_cancellation_signal(self) -> None:
+        """Background task: wait for ``self._cancellation_signal`` to fire,
+        then yank every in-flight tool task via its CancelScope.
+
+        Lives in the executor's task group. On clean executor shutdown
+        (signal never fired) ``__aexit__`` calls ``self._watcher_scope.cancel()``
+        to wake us out of the indefinite ``await``. The CancelledError
+        is caught here and swallowed — clean exit, no propagation.
+        """
+        assert self._cancellation_signal is not None
+        assert self._watcher_scope is not None
+        try:
+            with self._watcher_scope:
+                await self._cancellation_signal.wait()
+                # Signal fired. Flip the flag so any subsequent
+                # ``add_tool_call`` short-circuits, and cancel every
+                # in-flight per-task scope so the running bodies bail.
+                self._signal_cancelled = True
+                # Snapshot the list — new scopes appended after the
+                # snapshot are caught by the ``_signal_cancelled`` flag
+                # check in ``add_tool_call``.
+                for sc in list(self._scopes):
+                    sc.cancel()
+        except anyio.get_cancelled_exc_class():
+            # Clean shutdown — executor exited before signal fired.
+            return
 
     # ------------------------------------------------------------------
     # Public API
@@ -259,7 +334,16 @@ class StreamingToolExecutor:
         self._calls.append(block)
         self._results.append(None)
         self._scopes.append(anyio.CancelScope())
-        # Fast-fail if already aborted by a sibling error.
+        # Fast-fail paths — return BEFORE spawning a task. Two flavors,
+        # each producing a distinct error message so callers can tell
+        # what happened from the ToolResultBlock alone.
+        if self._signal_cancelled:
+            self._results[idx] = ToolResultBlock(
+                tool_use_id=block.id,
+                content="cancelled by signal",
+                is_error=True,
+            )
+            return
         if self._aborted:
             self._results[idx] = ToolResultBlock(
                 tool_use_id=block.id,
@@ -285,13 +369,18 @@ class StreamingToolExecutor:
         while self._pending > 0:
             await self._idle_event.wait()
         # Fill any leftover Nones (cancellation races).
+        fallback_reason = (
+            "cancelled by signal"
+            if self._signal_cancelled
+            else "tool execution cancelled"
+        )
         out: list[ToolResultBlock] = []
         for i, r in enumerate(self._results):
             if r is None:
                 call = self._calls[i]
                 r = ToolResultBlock(
                     tool_use_id=call.id,
-                    content="tool execution cancelled",
+                    content=fallback_reason,
                     is_error=True,
                 )
                 self._results[i] = r
@@ -428,10 +517,21 @@ class StreamingToolExecutor:
         for sc in self._scopes:
             sc.cancel()
 
-    @staticmethod
-    def _cancelled_result(block: ToolUseBlock) -> ToolResultBlock:
+    def _cancelled_result(self, block: ToolUseBlock) -> ToolResultBlock:
+        """Build the cancellation-error result block for ``block``.
+
+        The reason string depends on *why* the cancel scope fired —
+        signal-driven cancellation produces ``"cancelled by signal"``
+        so a user-facing UI can distinguish abort-on-sibling-error
+        (recover-and-retry) from agent-cancel (user wants out).
+        """
+        reason = (
+            "cancelled by signal"
+            if self._signal_cancelled
+            else "aborted by sibling tool error"
+        )
         return ToolResultBlock(
             tool_use_id=block.id,
-            content="aborted by sibling tool error",
+            content=reason,
             is_error=True,
         )

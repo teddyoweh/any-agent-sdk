@@ -216,15 +216,25 @@ class Agent:
     def cancel(self) -> None:
         """Signal cancellation. Idempotent.
 
-        Fires the agent's ``cancellation_signal`` so any can_use_tool
-        callback inspecting ``ToolPermissionContext.signal`` sees
-        ``signal.is_set() is True`` on the next check. Cooperating tool
-        bodies watching the same event can also observe and bail.
+        Fires the agent's ``cancellation_signal`` so:
 
-        Currently advisory — the agent loop doesn't yet auto-deny pending
-        tool calls when the signal fires (lands with the streaming-
-        dispatch rewrite). For now, the user wires the deny themselves
-        from inside ``can_use_tool``.
+          * Any ``can_use_tool`` callback inspecting
+            ``ToolPermissionContext.signal`` sees ``signal.is_set() is True``
+            on the next check.
+          * The :class:`StreamingToolExecutor` cancels every in-flight tool
+            task via its per-task ``CancelScope`` — running tool bodies see
+            ``anyio.get_cancelled_exc_class()`` raised at the next ``await``
+            and unwind cooperatively.
+          * Any ``tool_use`` block that arrives *after* cancel short-circuits
+            to a ``ToolResultBlock(content="cancelled by signal", is_error=True)``
+            without dispatching.
+          * The agent's run-loop exits at the next turn boundary — no more
+            model calls are issued after ``cancel()`` fires.
+
+        Cooperating tool bodies that don't want to rely on the implicit
+        CancelScope can still ``await ctx.signal.wait()`` from a background
+        task or peek ``ctx.signal.is_set()`` periodically and bail
+        themselves.
         """
 
         if not self.cancellation_signal.is_set():
@@ -406,6 +416,17 @@ class Agent:
         registry: ToolRegistry = self.tools  # type: ignore[assignment]
 
         for _ in range(self.max_steps):
+            # If the cancellation signal already fired BEFORE this turn
+            # starts, bail without burning another model round-trip. The
+            # signal could be set externally (``Agent.cancel()``), or by
+            # the prior turn's tool cancellation cascade. Either way the
+            # contract is: don't ask the model again after cancel.
+            if self.cancellation_signal.is_set():
+                await self._dispatcher.dispatch(
+                    "Stop",
+                    HookContext(event="Stop", messages_snapshot=messages),
+                )
+                return
             # --------------------------------------------------------------
             # One turn, with mid-stream tool dispatch.
             #
@@ -431,7 +452,10 @@ class Agent:
             # passed to hooks so they see the same context the model saw.
             messages_snapshot = list(messages)
 
-            async with StreamingToolExecutor(registry) as executor:
+            async with StreamingToolExecutor(
+                registry,
+                cancellation_signal=self.cancellation_signal,
+            ) as executor:
                 async for ev in self._provider_stream(messages):
                     assembler.feed(ev)
                     if isinstance(ev, ContentBlockStop):
