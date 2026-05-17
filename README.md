@@ -289,7 +289,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] `tools_option.py`
 - [x] `mcp_calculator.py`
 - [x] `system_prompt.py`
-- [ ] `fireworks_hosted.py` runs against live Fireworks
+- [x] `fireworks_hosted.py` runs against live Fireworks
 - [ ] `vllm_self_hosted.py` runs against live vLLM
 - [x] `multi_agent_research.py` end-to-end with sub-agents
 
