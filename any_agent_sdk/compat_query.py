@@ -277,7 +277,9 @@ def _build_agent(opts: dict[str, Any]) -> Agent:
         "tools": registry,
         "max_tokens": opts.get("max_tokens", 1024),
         "temperature": opts.get("temperature"),
-        "max_steps": opts.get("max_turns", opts.get("max_steps", 20)),
+        # Default ``None`` → unlimited turns (matches Agent default).
+        # Caller can still pin a ceiling via ``max_turns=N`` / ``max_steps=N``.
+        "max_steps": opts.get("max_turns", opts.get("max_steps")),
         "max_usd": opts.get("max_usd"),
     }
     for key in ("hooks", "permissions", "budget", "include_memory"):
