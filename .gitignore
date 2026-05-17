@@ -34,3 +34,6 @@ env/
 # Local
 *.log
 .cache/
+
+# Docs build output
+site/

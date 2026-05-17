@@ -1,0 +1,118 @@
+site_name: any-agent-sdk
+site_description: Drop-in open-source agent SDK. Multi-model, streaming, MCP, sub-agents.
+site_url: https://teddyoweh.github.io/any-agent-sdk/
+repo_url: https://github.com/teddyoweh/any-agent-sdk
+repo_name: teddyoweh/any-agent-sdk
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.tracking
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: deep purple
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/robot-outline
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/teddyoweh/any-agent-sdk
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/any-agent-sdk/
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - getting-started/index.md
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+      - Local setup: getting-started/local-setup.md
+      - Configuration: getting-started/configuration.md
+  - Guides:
+      - guides/index.md
+      - Models and backends: guides/models-and-backends.md
+      - Tools: guides/tools.md
+      - Streaming: guides/streaming.md
+      - Permissions: guides/permissions.md
+      - Hooks: guides/hooks.md
+      - Sessions and resume: guides/sessions.md
+      - Thinking blocks: guides/thinking.md
+      - Budget and limits: guides/budget.md
+      - MCP servers: guides/mcp.md
+      - Sub-agents: guides/sub-agents.md
+      - Plugins: guides/plugins.md
+      - Memory: guides/memory.md
+  - API reference:
+      - api/index.md
+      - query / ClaudeSDKClient: api/client.md
+      - ClaudeAgentOptions: api/options.md
+      - Message types: api/messages.md
+      - Tools: api/tools.md
+      - Errors: api/errors.md
+      - Sessions: api/sessions.md
+  - Examples:
+      - examples/index.md
+  - Development:
+      - development/plan.md
+      - development/plan-v1.md
+      - development/upstream-comparison.md
