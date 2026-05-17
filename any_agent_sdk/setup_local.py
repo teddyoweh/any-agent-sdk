@@ -35,10 +35,44 @@ __all__ = [
     "is_ollama_running",
     "start_ollama_server",
     "install_ollama",
+    "install_ollama_windows",
+    "WINDOWS_INSTALLER_URL",
+    "WINDOWS_DEFAULT_INSTALL_DIR",
     "pull_model",
     "smoke_test",
     "run_setup_local",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Windows install constants
+# ---------------------------------------------------------------------------
+#
+# Ollama ships an Inno Setup .exe — these are the silent-install flags it
+# documents:
+#
+#   /VERYSILENT        — no progress UI, no message boxes
+#   /SUPPRESSMSGBOXES  — auto-answer Yes on any box that would still appear
+#   /NORESTART         — never reboot afterwards (we don't ship reboot UX)
+#   /SP-               — skip the "this will install … Do you want to
+#                        continue?" preamble shown by /SILENT alone
+#
+# Together these are the same flags Microsoft Winget and Chocolatey use to
+# automate Inno Setup installers.  See:
+#   https://jrsoftware.org/ishelp/index.php?topic=setupcmdline
+
+WINDOWS_INSTALLER_URL = "https://ollama.com/download/OllamaSetup.exe"
+WINDOWS_INSTALLER_FLAGS: tuple[str, ...] = (
+    "/VERYSILENT",
+    "/SUPPRESSMSGBOXES",
+    "/NORESTART",
+    "/SP-",
+)
+# Default user-mode install dir for OllamaSetup.exe. Prepended to PATH
+# after a successful install so the *current* Python process can call
+# ``ollama`` immediately (the installer's HKCU PATH edit only reaches
+# *future* shells).
+WINDOWS_DEFAULT_INSTALL_DIR = r"%LOCALAPPDATA%\Programs\Ollama"
 
 
 # ---------------------------------------------------------------------------
@@ -286,19 +320,19 @@ def start_ollama_server(
 
 
 def install_ollama(*, auto_confirm: bool = False) -> int:
-    """Install Ollama via the official installer.
+    """Install Ollama via the official installer for the current platform.
 
-    Linux/macOS only — Windows users should install via the .exe from
-    ollama.com (we print a link instead of trying). Returns the exit
-    code of the install script.
+    * Linux / macOS: fetches ``https://ollama.com/install.sh`` and runs it
+      via ``sh``.
+    * Windows: dispatches to :func:`install_ollama_windows` which
+      downloads ``OllamaSetup.exe`` and runs it with Inno Setup's
+      silent-install flags.
+
+    Returns the exit code of the underlying installer. ``0`` = success.
     """
 
     if sys.platform.startswith("win"):
-        print(
-            "Windows: download the installer from https://ollama.com/download/windows",
-            file=sys.stderr,
-        )
-        return 2
+        return install_ollama_windows(auto_confirm=auto_confirm)
 
     if not auto_confirm:
         print("This will run: curl -fsSL https://ollama.com/install.sh | sh")
@@ -323,6 +357,174 @@ def install_ollama(*, auto_confirm: bool = False) -> int:
         return 1
 
     return subprocess.call(["sh", "-c", script])
+
+
+# ---------------------------------------------------------------------------
+# Windows-specific installer
+# ---------------------------------------------------------------------------
+
+
+def _safe_unlink(path: str) -> None:
+    """``os.unlink`` that swallows OSError — best-effort cleanup."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _prepend_to_process_path(directory: str) -> None:
+    """Prepend ``directory`` to ``os.environ['PATH']`` for the current process.
+
+    OllamaSetup.exe writes the install dir into HKCU\\Environment\\Path
+    via the registry, which only reaches *new* shells. The Python process
+    that just called ``install_ollama_windows`` keeps its old PATH, so a
+    follow-up ``shutil.which('ollama')`` would still return None. We patch
+    the in-process env so the rest of ``run_setup_local`` (pull, smoke
+    test) can find the binary without re-execing.
+    """
+
+    expanded = os.path.expandvars(directory)
+    if not expanded or not os.path.isdir(expanded):
+        # Nothing to add — installer ran but the expected dir isn't there
+        # (custom install path, sandbox quirk, etc.). Leave PATH alone.
+        return
+    sep = os.pathsep
+    existing = os.environ.get("PATH", "")
+    parts = existing.split(sep) if existing else []
+    # Case-insensitive on Windows; canonical-form check.
+    canonical = os.path.normcase(os.path.normpath(expanded))
+    for p in parts:
+        if os.path.normcase(os.path.normpath(p)) == canonical:
+            return  # already on PATH
+    os.environ["PATH"] = expanded + (sep + existing if existing else "")
+
+
+def install_ollama_windows(
+    *,
+    auto_confirm: bool = False,
+    download_url: str = WINDOWS_INSTALLER_URL,
+    installer_path: str | None = None,
+    timeout_s: float = 300.0,
+    install_dir: str = WINDOWS_DEFAULT_INSTALL_DIR,
+) -> int:
+    """Install Ollama on Windows by running the official ``OllamaSetup.exe``.
+
+    Downloads the installer from ``download_url`` to a temp file, runs it
+    with :data:`WINDOWS_INSTALLER_FLAGS` (Inno Setup silent flags), and
+    returns the installer's exit code. ``0`` is success.
+
+    The installer's HKCU PATH edit doesn't reach the currently running
+    Python process, so after a successful install this function also
+    prepends ``install_dir`` (expanded) to ``os.environ['PATH']``. That
+    way the rest of ``run_setup_local`` (which calls ``shutil.which`` and
+    ``ollama pull``) sees the new binary without the user having to
+    relaunch their shell.
+
+    Parameters
+    ----------
+    auto_confirm:
+        Skip the interactive "this will download X — proceed?" prompt.
+        Matches the POSIX :func:`install_ollama` contract.
+    download_url:
+        Where to fetch ``OllamaSetup.exe``. Overridable so tests don't
+        hit the network and so air-gapped users can point at a mirror.
+    installer_path:
+        Path to a pre-downloaded ``OllamaSetup.exe``. When set, the
+        download step is skipped entirely. Useful for offline installs
+        and for tests that don't want to mock urllib.
+    timeout_s:
+        How long to wait for the installer to finish. Default 5 minutes —
+        Inno Setup silent installs on a fresh machine typically take
+        20–60 seconds, but anti-virus scanning can stretch this.
+    install_dir:
+        Directory the installer drops ``ollama.exe`` into. Defaults to
+        ``%LOCALAPPDATA%\\Programs\\Ollama``, the per-user default Ollama
+        ships with. Pass an absolute path if the user picked ``/DIR=``
+        when running interactively before.
+    """
+
+    if not auto_confirm:
+        if installer_path:
+            print(f"This will run: {installer_path}")
+        else:
+            print(f"This will download and run: {download_url}")
+        try:
+            ans = input("Proceed? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            return 1
+        if ans not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+
+    cleanup_path: str | None = None
+    exe_path: str
+    if installer_path is None:
+        fd, tmp_path = tempfile.mkstemp(prefix="OllamaSetup-", suffix=".exe")
+        os.close(fd)
+        cleanup_path = tmp_path
+        exe_path = tmp_path
+        print(f"Downloading {download_url} …")
+        try:
+            req = urllib.request.Request(
+                download_url,
+                headers={"User-Agent": "any-agent-sdk/setup-local"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as r:
+                with open(tmp_path, "wb") as f:
+                    while True:
+                        chunk = r.read(64 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+        except (urllib.error.URLError, OSError) as e:
+            print(f"Failed to fetch installer: {e}", file=sys.stderr)
+            _safe_unlink(cleanup_path)
+            return 1
+    else:
+        exe_path = installer_path
+        if not os.path.isfile(exe_path):
+            print(
+                f"Installer not found at {exe_path}. "
+                "Pass --installer to point at a real OllamaSetup.exe.",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(f"Running {exe_path} {' '.join(WINDOWS_INSTALLER_FLAGS)} …")
+    try:
+        # We deliberately do NOT pass shell=True: the args are a list and
+        # the .exe is the program. shell=True would be a binhandling
+        # liability on Windows (cmd.exe quoting rules).
+        rc = subprocess.call(  # noqa: S603
+            [exe_path, *WINDOWS_INSTALLER_FLAGS],
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"Installer did not finish within {timeout_s:.0f}s. "
+            "Run it manually if needed.",
+            file=sys.stderr,
+        )
+        rc = 1
+    except OSError as e:
+        print(f"Failed to launch installer: {e}", file=sys.stderr)
+        rc = 1
+    finally:
+        if cleanup_path is not None:
+            _safe_unlink(cleanup_path)
+
+    if rc == 0:
+        _prepend_to_process_path(install_dir)
+        print("Ollama installed.")
+    else:
+        print(
+            f"Installer exited with code {rc}. "
+            "Check the OllamaSetup.exe logs (Start → Run → %TEMP%) "
+            "for details.",
+            file=sys.stderr,
+        )
+    return rc
 
 
 def pull_model(tag: str) -> int:

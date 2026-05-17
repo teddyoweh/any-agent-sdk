@@ -14,10 +14,15 @@ from unittest.mock import patch
 import pytest
 
 from any_agent_sdk import cli
+from any_agent_sdk import setup_local as setup_local_mod
 from any_agent_sdk.setup_local import (
     CPU_FRIENDLY_MODELS,
     DEFAULT_RECOMMENDATION,
     LocalModel,
+    WINDOWS_INSTALLER_FLAGS,
+    WINDOWS_INSTALLER_URL,
+    install_ollama,
+    install_ollama_windows,
     is_ollama_installed,
     is_ollama_running,
     print_model_table,
@@ -295,3 +300,392 @@ def test_cli_start_timeout_flag_parses() -> None:
     parser = cli._build_parser()
     args = parser.parse_args(["setup-local", "--start-timeout", "30"])
     assert args.start_timeout_s == 30.0
+
+
+# ---------------------------------------------------------------------------
+# Windows installer wrapper
+# ---------------------------------------------------------------------------
+#
+# These tests run on every platform — we don't gate on ``sys.platform``
+# because the function under test is pure-Python and the OS-specific bits
+# (subprocess launch, urllib fetch) are mocked. The function being
+# callable on Linux/macOS during the test suite is intentional: it keeps
+# us from accidentally writing code that imports ``win32api`` and silently
+# fails on the CI machines we actually run.
+
+
+import os
+import urllib.error
+
+
+def _make_installer_constants_known() -> None:
+    """Sanity check the module-level constants other tests rely on."""
+
+    assert WINDOWS_INSTALLER_URL.startswith("https://ollama.com/")
+    assert WINDOWS_INSTALLER_URL.endswith(".exe")
+    # The four canonical Inno Setup silent-install flags.
+    assert "/VERYSILENT" in WINDOWS_INSTALLER_FLAGS
+    assert "/SUPPRESSMSGBOXES" in WINDOWS_INSTALLER_FLAGS
+    assert "/NORESTART" in WINDOWS_INSTALLER_FLAGS
+    assert "/SP-" in WINDOWS_INSTALLER_FLAGS
+
+
+def test_windows_installer_constants_well_formed() -> None:
+    _make_installer_constants_known()
+
+
+def test_install_ollama_dispatches_to_windows_on_win32() -> None:
+    """The umbrella ``install_ollama()`` must route to the Windows path
+    when ``sys.platform`` looks like Windows. Without this, Windows users
+    get the old "go download it yourself" message back."""
+
+    with patch.object(setup_local_mod.sys, "platform", "win32"), patch.object(
+        setup_local_mod, "install_ollama_windows", return_value=0
+    ) as winstall:
+        rc = install_ollama(auto_confirm=True)
+
+    assert rc == 0
+    winstall.assert_called_once_with(auto_confirm=True)
+
+
+def test_install_ollama_does_not_dispatch_to_windows_on_posix() -> None:
+    """On Linux/macOS we must keep the curl-pipe-sh code path. Regressing
+    that would 404 on any non-Windows machine."""
+
+    with patch.object(setup_local_mod.sys, "platform", "linux"), patch.object(
+        setup_local_mod, "install_ollama_windows"
+    ) as winstall, patch.object(
+        setup_local_mod.urllib.request, "urlopen"
+    ) as urlopen, patch.object(
+        setup_local_mod.subprocess, "call", return_value=0
+    ):
+        # Fake a tiny install.sh body so the call() codepath runs.
+        urlopen.return_value.__enter__.return_value.read.return_value = b"#!/bin/sh\necho ok\n"
+        rc = install_ollama(auto_confirm=True)
+
+    assert rc == 0
+    winstall.assert_not_called()
+
+
+def test_install_ollama_windows_uses_preexisting_installer_when_provided(
+    tmp_path: object,
+) -> None:
+    """When ``installer_path`` is set, we MUST NOT fetch anything — the
+    user already has the .exe on disk. Mock urllib so a hit would fail
+    the test."""
+
+    fake_exe = tmp_path / "OllamaSetup.exe"  # type: ignore[operator]
+    fake_exe.write_bytes(b"MZ" + b"\x00" * 64)  # plausible PE header
+
+    with patch.object(
+        setup_local_mod.urllib.request, "urlopen"
+    ) as urlopen, patch.object(
+        setup_local_mod.subprocess, "call", return_value=0
+    ) as scall, patch.object(
+        setup_local_mod, "_prepend_to_process_path"
+    ):
+        rc = install_ollama_windows(
+            auto_confirm=True, installer_path=str(fake_exe)
+        )
+
+    assert rc == 0
+    urlopen.assert_not_called()
+    args, _ = scall.call_args
+    cmd = args[0]
+    assert cmd[0] == str(fake_exe)
+    # Every Inno Setup silent flag must be present, in order.
+    for flag in WINDOWS_INSTALLER_FLAGS:
+        assert flag in cmd, f"missing flag: {flag}"
+
+
+def test_install_ollama_windows_downloads_and_runs_installer(
+    tmp_path: object,
+) -> None:
+    """Happy path: download the .exe to a tempfile, run it silently,
+    return 0, then clean up the tempfile."""
+
+    # Capture which tempfile gets created so we can assert it was deleted.
+    captured_tmp: dict[str, str] = {}
+    real_mkstemp = setup_local_mod.tempfile.mkstemp
+
+    def spy_mkstemp(**kwargs: object) -> tuple[int, str]:
+        fd, p = real_mkstemp(**kwargs)
+        captured_tmp["path"] = p
+        return fd, p
+
+    fake_body = io.BytesIO(b"\x4d\x5a" + b"\x00" * 1024)  # tiny "exe"
+
+    with patch.object(
+        setup_local_mod.tempfile, "mkstemp", side_effect=spy_mkstemp
+    ), patch.object(setup_local_mod.urllib.request, "urlopen") as urlopen, patch.object(
+        setup_local_mod.subprocess, "call", return_value=0
+    ) as scall, patch.object(
+        setup_local_mod, "_prepend_to_process_path"
+    ) as path_patch:
+        urlopen.return_value.__enter__.return_value.read.side_effect = (
+            lambda n=-1: fake_body.read(n)
+        )
+        rc = install_ollama_windows(auto_confirm=True)
+
+    assert rc == 0
+    # We actually launched the installer with the silent flags.
+    args, _ = scall.call_args
+    cmd = args[0]
+    assert cmd[0] == captured_tmp["path"]
+    for flag in WINDOWS_INSTALLER_FLAGS:
+        assert flag in cmd
+    # The temp .exe was cleaned up post-run.
+    assert not os.path.exists(captured_tmp["path"])
+    # PATH was augmented for the current process.
+    path_patch.assert_called_once()
+
+
+def test_install_ollama_windows_handles_download_failure() -> None:
+    """When the .exe fetch fails (no network, 404, etc.), we must return
+    non-zero and NOT try to subprocess-launch a half-downloaded file."""
+
+    with patch.object(
+        setup_local_mod.urllib.request,
+        "urlopen",
+        side_effect=urllib.error.URLError("network down"),
+    ), patch.object(
+        setup_local_mod.subprocess, "call"
+    ) as scall:
+        rc = install_ollama_windows(auto_confirm=True)
+
+    assert rc == 1
+    scall.assert_not_called()
+
+
+def test_install_ollama_windows_propagates_installer_nonzero_exit(
+    tmp_path: object,
+) -> None:
+    """If OllamaSetup.exe returns 1 (user cancelled UAC, disk full,
+    whatever), the wrapper must surface that exit code — we don't
+    silently swallow errors."""
+
+    fake_exe = tmp_path / "OllamaSetup.exe"  # type: ignore[operator]
+    fake_exe.write_bytes(b"MZ")
+
+    with patch.object(
+        setup_local_mod.subprocess, "call", return_value=1602  # Windows ERROR_CANCELLED
+    ), patch.object(setup_local_mod, "_prepend_to_process_path") as path_patch:
+        rc = install_ollama_windows(
+            auto_confirm=True, installer_path=str(fake_exe)
+        )
+
+    assert rc == 1602
+    # Failed install → don't lie to the rest of the process about PATH.
+    path_patch.assert_not_called()
+
+
+def test_install_ollama_windows_handles_installer_missing(
+    tmp_path: object,
+) -> None:
+    """``installer_path`` pointing at a non-existent file must fail
+    fast with a clear error, not 'try to run it and OSError'."""
+
+    missing = tmp_path / "nope.exe"  # type: ignore[operator]
+    with patch.object(setup_local_mod.subprocess, "call") as scall:
+        rc = install_ollama_windows(
+            auto_confirm=True, installer_path=str(missing)
+        )
+    assert rc != 0
+    scall.assert_not_called()
+
+
+def test_install_ollama_windows_handles_subprocess_oserror(
+    tmp_path: object,
+) -> None:
+    """If Windows refuses to launch the installer (rare — corrupt download,
+    EPERM), we report and return non-zero without crashing."""
+
+    fake_exe = tmp_path / "OllamaSetup.exe"  # type: ignore[operator]
+    fake_exe.write_bytes(b"MZ")
+
+    with patch.object(
+        setup_local_mod.subprocess, "call", side_effect=OSError("denied")
+    ):
+        rc = install_ollama_windows(
+            auto_confirm=True, installer_path=str(fake_exe)
+        )
+
+    assert rc != 0
+
+
+def test_install_ollama_windows_respects_timeout(tmp_path: object) -> None:
+    """A stuck installer must time out cleanly, not block forever."""
+
+    import subprocess as real_subprocess
+
+    fake_exe = tmp_path / "OllamaSetup.exe"  # type: ignore[operator]
+    fake_exe.write_bytes(b"MZ")
+
+    with patch.object(
+        setup_local_mod.subprocess,
+        "call",
+        side_effect=real_subprocess.TimeoutExpired(cmd="OllamaSetup", timeout=1),
+    ):
+        rc = install_ollama_windows(
+            auto_confirm=True, installer_path=str(fake_exe), timeout_s=0.01
+        )
+
+    assert rc != 0
+
+
+def test_install_ollama_windows_prompts_when_not_auto_confirm() -> None:
+    """Without ``auto_confirm=True``, the wrapper must ask the user
+    before fetching/running anything — matches the POSIX contract."""
+
+    with patch("builtins.input", return_value="n"), patch.object(
+        setup_local_mod.urllib.request, "urlopen"
+    ) as urlopen, patch.object(
+        setup_local_mod.subprocess, "call"
+    ) as scall:
+        rc = install_ollama_windows()
+
+    assert rc != 0
+    urlopen.assert_not_called()
+    scall.assert_not_called()
+
+
+def test_install_ollama_windows_proceeds_on_yes() -> None:
+    """``y`` at the prompt should proceed all the way through."""
+
+    fake_body = io.BytesIO(b"MZ")
+    with patch("builtins.input", return_value="y"), patch.object(
+        setup_local_mod.urllib.request, "urlopen"
+    ) as urlopen, patch.object(
+        setup_local_mod.subprocess, "call", return_value=0
+    ) as scall, patch.object(setup_local_mod, "_prepend_to_process_path"):
+        urlopen.return_value.__enter__.return_value.read.side_effect = (
+            lambda n=-1: fake_body.read(n)
+        )
+        rc = install_ollama_windows()
+    assert rc == 0
+    urlopen.assert_called()
+    scall.assert_called()
+
+
+def test_install_ollama_windows_prompt_eof_returns_nonzero() -> None:
+    """If stdin closes during the prompt (CI environment, no TTY), we
+    must NOT silently proceed — that would surprise-install Ollama."""
+
+    with patch("builtins.input", side_effect=EOFError()), patch.object(
+        setup_local_mod.urllib.request, "urlopen"
+    ) as urlopen:
+        rc = install_ollama_windows()
+    assert rc != 0
+    urlopen.assert_not_called()
+
+
+def test_install_ollama_windows_uses_no_shell_arg(tmp_path: object) -> None:
+    """Belt-and-suspenders: the installer launch must NOT use ``shell=True``.
+    Inno Setup .exes need argv-style invocation; shell=True on Windows
+    runs cmd.exe which mangles flag quoting and is a security smell."""
+
+    fake_exe = tmp_path / "OllamaSetup.exe"  # type: ignore[operator]
+    fake_exe.write_bytes(b"MZ")
+
+    with patch.object(
+        setup_local_mod.subprocess, "call", return_value=0
+    ) as scall, patch.object(setup_local_mod, "_prepend_to_process_path"):
+        install_ollama_windows(auto_confirm=True, installer_path=str(fake_exe))
+
+    _, kwargs = scall.call_args
+    # The current implementation simply omits `shell=`. Either way: not True.
+    assert kwargs.get("shell") in (None, False)
+
+
+def test_install_ollama_windows_passes_custom_download_url(
+    tmp_path: object,
+) -> None:
+    """A custom ``download_url`` (mirror / pinned version) must be the
+    URL we fetch — not the default URL."""
+
+    fake_body = io.BytesIO(b"MZ")
+    seen: dict[str, str] = {}
+
+    def fake_urlopen(req: object, *args: object, **kwargs: object) -> object:
+        seen["url"] = getattr(req, "full_url", str(req))
+        ctx = object()
+        # mimic context manager + read()
+        class _R:
+            def __enter__(self_inner: object) -> object: return self_inner
+            def __exit__(self_inner: object, *a: object) -> bool: return False
+            def read(self_inner: object, n: int = -1) -> bytes: return fake_body.read(n)
+        return _R()
+
+    custom = "https://mirror.example/OllamaSetup-pinned.exe"
+    with patch.object(
+        setup_local_mod.urllib.request, "urlopen", side_effect=fake_urlopen
+    ), patch.object(
+        setup_local_mod.subprocess, "call", return_value=0
+    ), patch.object(setup_local_mod, "_prepend_to_process_path"):
+        rc = install_ollama_windows(auto_confirm=True, download_url=custom)
+
+    assert rc == 0
+    assert seen["url"] == custom
+
+
+def test_prepend_to_process_path_handles_missing_dir(tmp_path: object) -> None:
+    """Pointing at a non-existent install dir must be a no-op, not raise.
+    This matters because OllamaSetup.exe accepts a ``/DIR=`` flag and we
+    can't know the user's choice."""
+
+    before = os.environ.get("PATH", "")
+    setup_local_mod._prepend_to_process_path(
+        str(tmp_path / "does-not-exist")  # type: ignore[operator]
+    )
+    after = os.environ.get("PATH", "")
+    assert before == after
+
+
+def test_prepend_to_process_path_prepends_when_dir_exists(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Happy path for the PATH augmentation: the install dir lands at the
+    *front* of PATH so ``shutil.which`` returns the freshly-installed
+    binary, not an older one lingering on PATH from a prior session."""
+
+    # Create a real directory so the function doesn't bail early.
+    real_dir = tmp_path / "Ollama"  # type: ignore[operator]
+    real_dir.mkdir()
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    setup_local_mod._prepend_to_process_path(str(real_dir))
+    new_path = os.environ["PATH"]
+    assert new_path.split(os.pathsep)[0] == str(real_dir)
+    # Old entries preserved.
+    assert "/usr/bin" in new_path.split(os.pathsep)
+
+
+def test_prepend_to_process_path_is_idempotent(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Calling twice doesn't pile the same dir onto PATH twice — keeps
+    PATH from growing unboundedly across repeat setup runs."""
+
+    real_dir = tmp_path / "Ollama"  # type: ignore[operator]
+    real_dir.mkdir()
+    monkeypatch.setenv("PATH", str(real_dir) + os.pathsep + "/usr/bin")
+    before = os.environ["PATH"]
+    setup_local_mod._prepend_to_process_path(str(real_dir))
+    assert os.environ["PATH"] == before
+
+
+def test_run_setup_local_uses_windows_installer_on_win32() -> None:
+    """End-to-end wiring: ``run_setup_local(install_ollama_if_missing=True)``
+    on Windows must call ``install_ollama_windows``, not the Linux script."""
+
+    with patch.object(setup_local_mod.sys, "platform", "win32"), patch.object(
+        setup_local_mod, "is_ollama_installed", side_effect=[False, True]
+    ), patch.object(
+        setup_local_mod, "install_ollama_windows", return_value=0
+    ) as winstall, patch.object(
+        setup_local_mod, "is_ollama_running", return_value=True
+    ), patch.object(
+        setup_local_mod, "pull_model", return_value=0
+    ), patch.object(setup_local_mod, "smoke_test", return_value=True):
+        rc = run_setup_local(install_ollama_if_missing=True)
+    assert rc == 0
+    winstall.assert_called_once()

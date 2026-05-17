@@ -279,7 +279,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] `any-agent setup-local` — installs Ollama if missing, pulls a CPU-friendly model, smoke tests
 - [x] 12-entry CPU-friendly catalog (135M → 8B params)
 - [x] Auto-install of Ollama on Linux/macOS via official script
-- [ ] Windows installer wrapper
+- [x] Windows installer wrapper
 - [x] llama.cpp `setup-local` alternative for users who prefer it (`any-agent setup-local-llamacpp`)
 
 **Examples (run verbatim against DeepSeek-R1 1.5B on local Ollama)**
