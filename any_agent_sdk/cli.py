@@ -235,8 +235,9 @@ def _add_agent_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--max-turns",
         type=int,
-        default=10,
-        help="Maximum agent turns before stopping (default 10).",
+        default=None,
+        help="Maximum agent turns before stopping (default: unlimited; "
+             "use --max-usd or budgets for cost-based caps).",
     )
 
 

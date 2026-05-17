@@ -114,7 +114,13 @@ class Agent:
     tools: ToolRegistry | list = field(default_factory=ToolRegistry)
     max_tokens: int = 1024
     temperature: float | None = None
-    max_steps: int = 20
+    # ``max_steps`` is the agent loop's turn cap. ``None`` (the default)
+    # means *unlimited* — the loop runs until the assistant emits a
+    # natural-stop turn (no tool_use blocks), the user calls
+    # ``Agent.cancel()``, or a budget overrun raises ``BudgetExceededError``.
+    # Pass a concrete int when you need a hard ceiling (CI, tests,
+    # untrusted prompts).
+    max_steps: int | None = None
     max_turns: int | None = None  # alias for max_steps
     extra: dict[str, Any] | None = None
 
@@ -405,7 +411,19 @@ class Agent:
 
         registry: ToolRegistry = self.tools  # type: ignore[assignment]
 
-        for _ in range(self.max_steps):
+        # ``max_steps=None`` means unlimited — drive the loop with
+        # ``itertools.count()``. The loop exits cleanly when the assistant
+        # emits a natural-stop turn (no tool_use blocks), the budget
+        # tracker raises, or the user cancels. The bounded branch keeps
+        # the same ``range()`` semantics as before for back-compat with
+        # tests and callers that set an explicit ceiling.
+        if self.max_steps is None:
+            import itertools  # noqa: PLC0415
+            step_iter: Iterable = itertools.count()
+        else:
+            step_iter = range(self.max_steps)
+
+        for _ in step_iter:
             # --------------------------------------------------------------
             # One turn, with mid-stream tool dispatch.
             #
@@ -523,7 +541,11 @@ class Agent:
             messages.append(tool_result_msg)
             yield tool_result_msg
 
-        _log.warning("agent hit max_steps=%d without natural stop", self.max_steps)
+        # Only reachable when ``max_steps`` is a bounded int (the
+        # ``itertools.count()`` branch never terminates here). Surface
+        # the hit-the-ceiling case so callers can tell "ran out of
+        # turns" apart from "natural stop".
+        _log.warning("agent hit max_steps=%s without natural stop", self.max_steps)
 
     async def _maybe_dispatch_closed_block(
         self,
