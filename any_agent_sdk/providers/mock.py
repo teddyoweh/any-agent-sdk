@@ -71,6 +71,14 @@ class MockProvider:
         # Cache of (model, scenario) → events list to avoid re-reading
         # fixture files on every call.
         self._fixture_cache: dict[tuple[str, str | None], list[StreamEvent]] = {}
+        # Observability for tests — capture the kwargs of the most recent
+        # stream() call, plus a per-call append-only log. Lets tests assert
+        # on what the Agent layer actually forwarded (e.g. ``response_format``
+        # translation, tool wire shapes, custom headers via extra). Cheap;
+        # only populated on calls so production users pay one dict each turn.
+        self.last_extra: dict[str, Any] | None = None
+        self.last_call_kwargs: dict[str, Any] | None = None
+        self.calls: list[dict[str, Any]] = []
 
     async def stream(
         self,
@@ -85,8 +93,25 @@ class MockProvider:
         model_capability: ModelCapability | None = None,
     ) -> AsyncIterator[StreamEvent]:
         # Materialize messages so callers passing generators don't burn them.
-        # We don't use them here, but tests may inspect them via a wrapper.
-        _ = list(messages)
+        # Tests sometimes inspect ``last_call_kwargs["messages"]`` to verify
+        # that the agent loop built the wire-form messages correctly.
+        msg_list = list(messages)
+
+        # Snapshot the call kwargs for test introspection. Shallow copies
+        # only — we don't want to deep-copy the entire stream event scripts.
+        call_record: dict[str, Any] = {
+            "model": model,
+            "messages": msg_list,
+            "system": system,
+            "tools": list(tools) if tools else None,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "extra": dict(extra) if isinstance(extra, dict) else extra,
+            "model_capability": model_capability,
+        }
+        self.last_extra = call_record["extra"]
+        self.last_call_kwargs = call_record
+        self.calls.append(call_record)
 
         events = self._pick_events(model, extra)
         for ev in events:

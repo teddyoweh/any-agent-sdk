@@ -8,6 +8,20 @@ The full versioning policy is in [SEMVER.md](SEMVER.md).
 
 ## [Unreleased]
 
+### Added
+
+- **Structured output via `response_format`.** New `Agent(response_format=...)`
+  and `ClaudeAgentOptions(response_format=...)` fields accept the OpenAI
+  `response_format` shape — `{"type": "json_object"}` for free-form JSON, or
+  `{"type": "json_schema", "json_schema": {"name": ..., "schema": ..., "strict": ...}}`
+  for schema-constrained output. The agent layer translates per backend:
+  OpenAI-compat / Modal / llama.cpp pass the envelope through verbatim,
+  Ollama maps to its native top-level `format` field, TGI maps to
+  `parameters.grammar`. `anthropic_passthrough` raises a loud
+  `ResponseFormatError` (real Anthropic API has no `response_format`).
+  Three new public exports: `ResponseFormatError`,
+  `normalize_response_format`, `translate_response_format`.
+
 ## [1.0.0] — 2026-05-17
 
 First stable release. The public API — the set of names in

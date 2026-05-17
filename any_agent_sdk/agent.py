@@ -134,6 +134,13 @@ class Agent:
     # Set to False for tests / containerized runs where you don't want disk I/O.
     include_memory: bool = True
 
+    # Structured output — see ``response_format.py``. ``None`` means "model
+    # is free to emit any text"; a dict in OpenAI ``response_format`` shape
+    # is translated per backend at provider-stream time. Normalized once at
+    # __post_init__ so a bad value blows up at construction (where the user
+    # can fix it) rather than at first turn.
+    response_format: dict[str, Any] | None = None
+
     # Internal state populated in __post_init__ / run loop.
     _dispatcher: HookDispatcher | None = field(default=None, init=False)
     _budget_tracker: BudgetTracker | None = field(default=None, init=False)
@@ -176,6 +183,15 @@ class Agent:
         # Propagate temperature from capability if user didn't set one.
         if self.temperature is None:
             self.temperature = self.model_capability.recommended_temperature
+
+        # Normalize ``response_format`` early so a malformed value fails at
+        # ``Agent(...)`` time, not on the first ``run()`` call. We don't
+        # store the canonicalized form — translate_response_format() needs
+        # to re-canonicalize per call anyway (cheap, dict-only) and
+        # round-tripping the raw input lets tests inspect it as-given.
+        if self.response_format is not None:
+            from .response_format import normalize_response_format
+            normalize_response_format(self.response_format)
 
         # Memory + user-context will be injected at run() time as a
         # synthetic <system-reminder>-wrapped UserMessage with
@@ -727,6 +743,40 @@ class Agent:
 
         assert self.provider is not None  # post-init guarantees this
 
+        # Build the ``extra`` dict for the provider. We may layer a
+        # ``response_format`` translation on top of the user-supplied extras.
+        # Merge order: translator output FIRST, then user extras on top —
+        # so an explicit ``Agent.extra={"response_format": {...}}`` overrides
+        # the high-level ``response_format`` field. That's the escape hatch
+        # for backends with quirky wire shapes the translator doesn't know
+        # about yet. For nested dicts (``parameters``, ``options``) we
+        # shallow-merge per inner key so we don't clobber e.g. a user-set
+        # ``parameters.seed`` when the translator only emitted
+        # ``parameters.grammar``.
+        provider_extra: dict[str, Any] | None
+        if self.response_format is not None:
+            from .response_format import translate_response_format
+            provider_name = getattr(self.provider, "name", "") or ""
+            rf_extra = translate_response_format(
+                self.response_format, provider_name
+            )
+            if self.extra:
+                merged = dict(rf_extra)
+                for k, v in self.extra.items():
+                    existing = merged.get(k)
+                    if isinstance(existing, dict) and isinstance(v, dict):
+                        # Inner-key shallow merge: user wins on inner-key
+                        # collisions but keeps any keys only set by the
+                        # translator (e.g. ``parameters.grammar``).
+                        merged[k] = {**existing, **v}
+                    else:
+                        merged[k] = v
+                provider_extra = merged
+            else:
+                provider_extra = dict(rf_extra)
+        else:
+            provider_extra = self.extra
+
         # Pass the resolved capability through so the provider can pick the
         # right tool-use path (A/B/C) without re-doing lookup.
         kwargs: dict[str, Any] = {
@@ -736,7 +786,7 @@ class Agent:
             "tools": self.tools.to_wire() if self.tools else None,
             "max_tokens": self.max_tokens,
             "temperature": self.temperature,
-            "extra": self.extra,
+            "extra": provider_extra,
         }
         # Some legacy adapters don't accept model_capability; gate it.
         try:

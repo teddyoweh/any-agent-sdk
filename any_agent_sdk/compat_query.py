@@ -343,7 +343,7 @@ def _build_agent(opts: dict[str, Any]) -> Agent:
         "max_steps": opts.get("max_turns", opts.get("max_steps", 20)),
         "max_usd": opts.get("max_usd"),
     }
-    for key in ("hooks", "permissions", "budget", "include_memory"):
+    for key in ("hooks", "permissions", "budget", "include_memory", "response_format"):
         if key in opts:
             kw[key] = opts[key]
 
@@ -355,7 +355,7 @@ def _build_agent(opts: dict[str, Any]) -> Agent:
         "model", "backend", "tools", "system", "max_tokens", "temperature",
         "max_turns", "max_steps", "max_usd", "api_key",
         "persist", "session_id", "cwd", "permission_mode",
-        "mcp_servers", "agents", "setting_sources",
+        "mcp_servers", "agents", "setting_sources", "response_format",
     }
     extra = {k: v for k, v in opts.items() if k not in consumed}
     if extra:

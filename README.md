@@ -268,6 +268,12 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] Session fork
 - [x] Session resume from arbitrary checkpoint
 
+**Structured output**
+- [x] `response_format={"type": "json_object"}` — free-form JSON mode
+- [x] `response_format={"type": "json_schema", "json_schema": {...}}` — schema-constrained
+- [x] Per-backend translation (OpenAI envelope / Ollama `format` / TGI grammar)
+- [x] Loud rejection on backends without support (`anthropic_passthrough`)
+
 **Budget**
 - [x] Per-model pricing table
 - [x] `max_usd` ceiling → `BudgetExceededError`

@@ -132,6 +132,11 @@ from .subagent import (
     WrappedAgentTool,
     as_subagent_tool,
 )
+from .response_format import (
+    ResponseFormatError,
+    normalize_response_format,
+    translate_response_format,
+)
 from .tools import Tool, ToolRegistry, tool
 from .types import (
     AssistantMessage,
@@ -237,6 +242,10 @@ __all__ = [
     "fork_session",
     "make_checkpoints",
     "resume_session",
+    # Structured output
+    "ResponseFormatError",
+    "normalize_response_format",
+    "translate_response_format",
     # Errors
     "AgentError",
     "AuthError",

@@ -361,6 +361,7 @@ def _agent_from_options(opts: dict[str, Any]) -> Agent:
         "model_capability",
         "backend_capability",
         "provider",
+        "response_format",
     ):
         if key in opts:
             agent_kwargs[key] = opts[key]

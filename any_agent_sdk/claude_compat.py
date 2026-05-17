@@ -158,6 +158,12 @@ class ClaudeAgentOptions:
     # Streaming knobs
     include_partial_messages: bool = False
 
+    # Structured output — see ``any_agent_sdk.response_format``. Accepts the
+    # OpenAI ``response_format`` shape (``{"type": "json_object"}`` or
+    # ``{"type": "json_schema", "json_schema": {...}}``); the agent layer
+    # translates per backend at provider-stream time.
+    response_format: dict[str, Any] | None = None
+
     # Diagnostics — Claude SDK exposes a ``stderr`` callable that
     # receives every line the underlying CLI writes to stderr. For
     # any-agent-sdk we don't shell out to a CLI, but we still accept the
@@ -300,6 +306,12 @@ class ClaudeAgentOptions:
         # explicit options here (so anything the user just set wins).
         if self.setting_sources is not None:
             opts["setting_sources"] = list(self.setting_sources)
+
+        # Structured output. Top-level (not under extra) so
+        # ``_agent_from_options`` can route it to the Agent constructor
+        # field instead of stashing it in Agent.extra.
+        if self.response_format is not None:
+            opts["response_format"] = dict(self.response_format)
 
         # User-supplied extras win over our auto-stashed ones.
         if self.extra:
