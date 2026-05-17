@@ -228,7 +228,15 @@ class OllamaProvider(HTTPProviderMixin):
         if temperature is not None:
             payload["options"]["temperature"] = temperature
         if use_native_tools:
-            payload["tools"] = tools
+            # Ollama expects OpenAI-shape function tools, NOT the
+            # Anthropic shape returned by Tool.to_wire(). Passing the
+            # Anthropic shape silently fails: Ollama still emits a
+            # tool_call, but with name="" and mangled arguments — the
+            # agent loop drops empty-name calls and the assistant ends
+            # up with zero content blocks, which looks like "the model
+            # ignored the tools" but is really us sending the wrong
+            # schema on the wire.
+            payload["tools"] = [_to_openai_tool(t) for t in tools]
         if extra:
             # Merge ``extra.options`` into payload.options instead of clobbering.
             opts = extra.pop("options", None) if isinstance(extra, dict) else None
@@ -646,6 +654,33 @@ def _decode_usage(chunk: dict[str, Any]) -> Usage | None:
         input_tokens=int(prompt or 0),
         output_tokens=int(eval_count or 0),
     )
+
+
+def _to_openai_tool(t: dict[str, Any]) -> dict[str, Any]:
+    """Translate Anthropic-shape ``{name, description, input_schema}`` into the
+    OpenAI-shape ``{type: "function", function: {name, description, parameters}}``
+    that Ollama (and llama.cpp's ``--jinja`` mode, vLLM, TGI, …) require.
+
+    If the input is already OpenAI-shape, it's returned unchanged so callers
+    can mix sources without us re-wrapping. Missing fields are tolerated —
+    we copy what's present.
+    """
+
+    if not isinstance(t, dict):
+        return t
+    if t.get("type") == "function" and isinstance(t.get("function"), dict):
+        return t
+    fn: dict[str, Any] = {}
+    if "name" in t:
+        fn["name"] = t["name"]
+    if "description" in t:
+        fn["description"] = t["description"]
+    # Anthropic calls the schema `input_schema`; OpenAI calls it `parameters`.
+    if "input_schema" in t:
+        fn["parameters"] = t["input_schema"]
+    elif "parameters" in t:
+        fn["parameters"] = t["parameters"]
+    return {"type": "function", "function": fn}
 
 
 def _map_stop_reason(done_reason: str | None, *, has_tool_calls: bool) -> str:
