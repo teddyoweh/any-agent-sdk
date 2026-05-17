@@ -1,12 +1,28 @@
 """``StreamingToolExecutor`` — kick off tool calls as soon as their JSON
 finalizes mid-stream, run them with the right concurrency rules, and produce
-``ToolResultBlock``s in insertion order when the turn is done.
+``ToolResultBlock``s as they complete (or in insertion order via
+``wait_all`` when the turn is done).
 
 This is the *speed unlock* described in ``docs/plan.md`` §5. The naive
 "wait until message_stop, then dispatch" loop pays a per-tool serialization
 tax even when tools could overlap. By starting each tool the moment its
 ``</tool_call>`` / native ``tool_use.stop`` arrives, multi-tool turns finish
 in roughly ``max(tool_durations)`` rather than ``sum(tool_durations)``.
+
+Two ways to observe results
+---------------------------
+* ``await ex.wait_all()`` — block until every dispatched tool finishes
+  and return a list of ``ToolResultBlock``s in **insertion order**
+  (same order as ``add_tool_call`` calls). Use this when downstream
+  needs the canonical result list for the assistant turn.
+* ``async for idx, result in ex.iter_completions(): ...`` — yield
+  ``(idx, ToolResultBlock)`` pairs in **completion order** as each tool
+  finishes. ``idx`` is the insertion index so callers can correlate. Use
+  this for live UIs that want to render "tool #2 done (120ms)" the
+  moment it completes, without waiting on slower siblings.
+* ``await ex.wait_one()`` — single-shot variant of ``iter_completions``.
+  Returns the next completion as ``(idx, ToolResultBlock)`` or ``None``
+  if the executor has closed with no further work pending.
 
 Behavior summary
 ----------------
@@ -33,19 +49,22 @@ Behavior summary
 Anyio, not asyncio
 ------------------
 We use ``anyio`` primitives throughout: ``create_task_group``,
-``CancelScope``, ``Semaphore``, ``Lock``, ``fail_after``. The agent loop
-must be driven by an anyio backend (default trio or asyncio under
-``anyio.run``). Never reach for ``asyncio.*`` here.
+``CancelScope``, ``Semaphore``, ``Lock``, ``fail_after``,
+``create_memory_object_stream``. The agent loop must be driven by an
+anyio backend (default trio or asyncio under ``anyio.run``). Never
+reach for ``asyncio.*`` here.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import os
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Optional
 
 import anyio
+import anyio.abc
 import msgspec
 
 from ..errors import ToolExecutionError
@@ -159,6 +178,13 @@ class StreamingToolExecutor:
         "_cancellation_signal",
         "_watcher_scope",
         "_closed",
+        # Completion-streaming channel — every ``_results[idx] = result``
+        # assignment goes through ``_record_result`` which pushes
+        # ``(idx, result)`` here. Consumers iterate via ``iter_completions``
+        # (completion order) or ``wait_all`` (insertion order).
+        "_completion_send",
+        "_completion_recv",
+        "_completion_closed",
     )
 
     def __init__(
@@ -207,6 +233,23 @@ class StreamingToolExecutor:
         # up when the executor closes cleanly (signal never fired).
         self._watcher_scope: anyio.CancelScope | None = None
         self._closed = False
+        # Completion-stream wiring. Unbounded buffer so result-recording
+        # paths never block; the buffer holds tiny ``(int, ToolResultBlock)``
+        # tuples. The send side is closed in ``__aexit__`` so consumers of
+        # ``iter_completions`` terminate cleanly. We must allocate the
+        # streams here (cheap) so callers can grab a receive handle BEFORE
+        # entering the ``async with`` block — useful for spinning up a
+        # consumer task in the same task group as the executor.
+        send, recv = anyio.create_memory_object_stream[
+            tuple[int, ToolResultBlock]
+        ](max_buffer_size=math.inf)
+        self._completion_send: anyio.abc.ObjectSendStream[
+            tuple[int, ToolResultBlock]
+        ] = send
+        self._completion_recv: anyio.abc.ObjectReceiveStream[
+            tuple[int, ToolResultBlock]
+        ] = recv
+        self._completion_closed = False
 
     # ------------------------------------------------------------------
     # Context manager
@@ -269,7 +312,9 @@ class StreamingToolExecutor:
                 raise
         finally:
             # Fill any leftover None slots — shouldn't happen if the TG joined
-            # cleanly, but a stray cancellation could leave a hole.
+            # cleanly, but a stray cancellation could leave a hole. Route
+            # through ``_record_result`` so any active ``iter_completions``
+            # consumer sees these backfills too before the stream closes.
             fallback_reason = (
                 "cancelled by signal"
                 if self._signal_cancelled
@@ -278,11 +323,18 @@ class StreamingToolExecutor:
             for i, r in enumerate(self._results):
                 if r is None:
                     call = self._calls[i]
-                    self._results[i] = ToolResultBlock(
-                        tool_use_id=call.id,
-                        content=fallback_reason,
-                        is_error=True,
+                    self._record_result(
+                        i,
+                        ToolResultBlock(
+                            tool_use_id=call.id,
+                            content=fallback_reason,
+                            is_error=True,
+                        ),
                     )
+            # Close the completion channel so iter_completions / wait_one
+            # consumers see EndOfStream and break their loops. Done AFTER
+            # the backfill so they observe every result first.
+            self._close_completion_stream()
             # Releases any wait_all() blocked on us.
             self._pending = 0
             if not self._idle_event.is_set():
@@ -318,6 +370,45 @@ class StreamingToolExecutor:
             return
 
     # ------------------------------------------------------------------
+    # Internal: result recording (drives both wait_all + iter_completions)
+    # ------------------------------------------------------------------
+
+    def _record_result(self, idx: int, result: ToolResultBlock) -> None:
+        """Write the result for ``idx`` and notify completion subscribers.
+
+        Idempotent: only the FIRST call for a given index pushes to the
+        completion channel. Subsequent calls (race-window backfills in
+        ``__aexit__`` / ``wait_all``) are silently dropped. This is what
+        lets us reuse the same recording path for fast-fail short circuits
+        AND post-invoke completions AND exit-time cleanup without ever
+        double-emitting a result for the same tool_use_id."""
+        if self._results[idx] is not None:
+            return
+        self._results[idx] = result
+        if self._completion_closed:
+            return
+        try:
+            self._completion_send.send_nowait((idx, result))
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            # Receive side already aborted (consumer crashed) — drop the
+            # event. The result is still recorded so wait_all sees it.
+            pass
+
+    def _close_completion_stream(self) -> None:
+        """Mark the completion channel closed and close the send side so
+        ``iter_completions`` consumers see ``EndOfStream`` and terminate.
+
+        Idempotent — safe to call multiple times. Called from ``__aexit__``
+        as part of teardown."""
+        if self._completion_closed:
+            return
+        self._completion_closed = True
+        try:
+            self._completion_send.close()
+        except Exception:  # noqa: BLE001 — close must never raise out
+            _LOG.debug("completion send-stream close raised", exc_info=True)
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -338,17 +429,23 @@ class StreamingToolExecutor:
         # each producing a distinct error message so callers can tell
         # what happened from the ToolResultBlock alone.
         if self._signal_cancelled:
-            self._results[idx] = ToolResultBlock(
-                tool_use_id=block.id,
-                content="cancelled by signal",
-                is_error=True,
+            self._record_result(
+                idx,
+                ToolResultBlock(
+                    tool_use_id=block.id,
+                    content="cancelled by signal",
+                    is_error=True,
+                ),
             )
             return
         if self._aborted:
-            self._results[idx] = ToolResultBlock(
-                tool_use_id=block.id,
-                content="aborted by sibling tool error",
-                is_error=True,
+            self._record_result(
+                idx,
+                ToolResultBlock(
+                    tool_use_id=block.id,
+                    content="aborted by sibling tool error",
+                    is_error=True,
+                ),
             )
             return
         # Bump pending and clear the idle gate.
@@ -378,14 +475,83 @@ class StreamingToolExecutor:
         for i, r in enumerate(self._results):
             if r is None:
                 call = self._calls[i]
-                r = ToolResultBlock(
-                    tool_use_id=call.id,
-                    content=fallback_reason,
-                    is_error=True,
+                self._record_result(
+                    i,
+                    ToolResultBlock(
+                        tool_use_id=call.id,
+                        content=fallback_reason,
+                        is_error=True,
+                    ),
                 )
-                self._results[i] = r
-            out.append(r)
+                r = self._results[i]
+            out.append(r)  # type: ignore[arg-type]
         return out
+
+    def iter_completions(
+        self,
+    ) -> AsyncIterator[tuple[int, ToolResultBlock]]:
+        """Yield ``(idx, ToolResultBlock)`` pairs as tools complete.
+
+        Completion order — **not** insertion order. The ``idx`` is the
+        insertion index (``add_tool_call`` ordinal, 0-based) so callers
+        can correlate with ``self.calls`` if they need original-order
+        positioning.
+
+        Terminates when the executor exits (the completion send-stream
+        is closed in ``__aexit__``). Safe to consume from inside the
+        ``async with`` block in parallel with ``add_tool_call`` calls —
+        the consumer will block on ``receive()`` whenever the queue is
+        empty and wake the instant the next tool finishes.
+
+        At-most-once delivery. Only one consumer can iterate at a time
+        (memory streams have a single receive side). For multiple
+        consumers, fan out via a downstream broadcast — the executor
+        does not duplicate."""
+        if self._tg is None and not self._closed:
+            raise RuntimeError("StreamingToolExecutor used outside async with")
+        return self._iter_completions()
+
+    async def _iter_completions(
+        self,
+    ) -> AsyncIterator[tuple[int, ToolResultBlock]]:
+        try:
+            async for item in self._completion_recv:
+                yield item
+        except anyio.EndOfStream:
+            return
+        except anyio.ClosedResourceError:
+            return
+
+    async def wait_one(self) -> tuple[int, ToolResultBlock] | None:
+        """Block until the next tool completion, return ``(idx, result)``.
+
+        Returns ``None`` if the executor has closed and no further
+        completions will arrive. Use ``iter_completions`` for a clean
+        ``async for`` loop; ``wait_one`` is for callers that want to
+        interleave manual control flow between completions."""
+        if self._tg is None and not self._closed:
+            raise RuntimeError("StreamingToolExecutor used outside async with")
+        try:
+            return await self._completion_recv.receive()
+        except (anyio.EndOfStream, anyio.ClosedResourceError):
+            return None
+
+    # ------------------------------------------------------------------
+    # Introspection — read-only views for callers iterating completions
+    # ------------------------------------------------------------------
+
+    @property
+    def calls(self) -> tuple[ToolUseBlock, ...]:
+        """Snapshot of every ``ToolUseBlock`` registered so far, in
+        insertion order. Lets ``iter_completions`` consumers map
+        ``idx`` → originating call without poking at internals."""
+        return tuple(self._calls)
+
+    @property
+    def pending(self) -> int:
+        """How many dispatched tools are still in flight. Reaches 0
+        when every tool has either completed or short-circuited."""
+        return self._pending
 
     # ------------------------------------------------------------------
     # Internals
@@ -405,7 +571,7 @@ class StreamingToolExecutor:
             with scope:
                 await self._run_one_inner(idx, block)
             if scope.cancelled_caught and self._results[idx] is None:
-                self._results[idx] = self._cancelled_result(block)
+                self._record_result(idx, self._cancelled_result(block))
         finally:
             self._pending -= 1
             if self._pending <= 0:
@@ -416,10 +582,13 @@ class StreamingToolExecutor:
     async def _run_one_inner(self, idx: int, block: ToolUseBlock) -> None:
         tool = self._registry.get(block.name)
         if tool is None:
-            self._results[idx] = ToolResultBlock(
-                tool_use_id=block.id,
-                content=f"tool {block.name!r} not found",
-                is_error=True,
+            self._record_result(
+                idx,
+                ToolResultBlock(
+                    tool_use_id=block.id,
+                    content=f"tool {block.name!r} not found",
+                    is_error=True,
+                ),
             )
             return
 
@@ -429,17 +598,23 @@ class StreamingToolExecutor:
                 allowed, reason = await self._can_use_tool(tool, block.input, {})
             except Exception as e:  # noqa: BLE001 — caller code must not crash us
                 _LOG.exception("can_use_tool raised")
-                self._results[idx] = ToolResultBlock(
-                    tool_use_id=block.id,
-                    content=f"permission check error: {e!r}",
-                    is_error=True,
+                self._record_result(
+                    idx,
+                    ToolResultBlock(
+                        tool_use_id=block.id,
+                        content=f"permission check error: {e!r}",
+                        is_error=True,
+                    ),
                 )
                 return
             if not allowed:
-                self._results[idx] = ToolResultBlock(
-                    tool_use_id=block.id,
-                    content=f"permission denied: {reason or 'no reason given'}",
-                    is_error=True,
+                self._record_result(
+                    idx,
+                    ToolResultBlock(
+                        tool_use_id=block.id,
+                        content=f"permission denied: {reason or 'no reason given'}",
+                        is_error=True,
+                    ),
                 )
                 return
 
@@ -448,19 +623,19 @@ class StreamingToolExecutor:
             if safe:
                 async with self._sem:
                     if self._aborted:
-                        self._results[idx] = self._cancelled_result(block)
+                        self._record_result(idx, self._cancelled_result(block))
                         return
                     await self._invoke(idx, tool, block)
             else:
                 async with self._serial_lock:
                     if self._aborted:
-                        self._results[idx] = self._cancelled_result(block)
+                        self._record_result(idx, self._cancelled_result(block))
                         return
                     await self._invoke(idx, tool, block)
         except anyio.get_cancelled_exc_class():
             # Cooperatively cancelled by sibling abort. Surface as error.
             if self._results[idx] is None:
-                self._results[idx] = self._cancelled_result(block)
+                self._record_result(idx, self._cancelled_result(block))
             raise  # propagate so the TG records the cancellation
 
     async def _invoke(self, idx: int, tool: Tool, block: ToolUseBlock) -> None:
@@ -474,10 +649,13 @@ class StreamingToolExecutor:
             else:
                 out = await tool.fn(**block.input)
         except TimeoutError:
-            self._results[idx] = ToolResultBlock(
-                tool_use_id=block.id,
-                content=f"tool {tool.name!r} timed out after {timeout}s",
-                is_error=True,
+            self._record_result(
+                idx,
+                ToolResultBlock(
+                    tool_use_id=block.id,
+                    content=f"tool {tool.name!r} timed out after {timeout}s",
+                    is_error=True,
+                ),
             )
             self._maybe_abort(tool)
             return
@@ -486,17 +664,23 @@ class StreamingToolExecutor:
             raise
         except Exception as e:  # noqa: BLE001 — user code must not crash us
             err = ToolExecutionError(tool.name, block.id, e)
-            self._results[idx] = ToolResultBlock(
-                tool_use_id=block.id,
-                content=str(err),
-                is_error=True,
+            self._record_result(
+                idx,
+                ToolResultBlock(
+                    tool_use_id=block.id,
+                    content=str(err),
+                    is_error=True,
+                ),
             )
             self._maybe_abort(tool)
             return
 
-        self._results[idx] = ToolResultBlock(
-            tool_use_id=block.id,
-            content=_stringify(out),
+        self._record_result(
+            idx,
+            ToolResultBlock(
+                tool_use_id=block.id,
+                content=_stringify(out),
+            ),
         )
 
     def _maybe_abort(self, tool: Tool) -> None:
