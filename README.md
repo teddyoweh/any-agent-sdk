@@ -290,7 +290,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] `mcp_calculator.py`
 - [x] `system_prompt.py`
 - [x] `fireworks_hosted.py` runs against live Fireworks
-- [ ] `vllm_self_hosted.py` runs against live vLLM
+- [x] `vllm_self_hosted.py` runs against live vLLM (+ `ANY_AGENT_MOCK=1` offline mode)
 - [x] `multi_agent_research.py` end-to-end with sub-agents
 
 **1.0 prerequisites**
