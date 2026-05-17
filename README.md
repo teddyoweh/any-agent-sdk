@@ -294,7 +294,7 @@ What's shipped — and what's still ahead. Check our progress.
 - [x] `multi_agent_research.py` end-to-end with sub-agents
 
 **1.0 prerequisites**
-- [ ] Streaming tool dispatch rewrite
+- [x] Streaming tool dispatch rewrite
 - [x] Mid-stream cancellation via `ToolPermissionContext.signal`
 - [x] All 16 examples verified against ≥ 3 backends
 - [x] Docs site (mkdocs-material)

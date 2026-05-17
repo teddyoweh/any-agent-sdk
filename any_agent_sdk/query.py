@@ -589,17 +589,36 @@ async def query(
         else None
     )
 
+    # Skip-set: ``agent.run_iter`` mutates ``running`` and re-yields the
+    # seed UserMessages we already echoed in step 2. Identity (``id(...)``)
+    # is the cheapest test that "this is the EXACT instance we passed in",
+    # so we don't accidentally drop a freshly-built duplicate.
+    seed_ids = {id(s) for s in seeds}
+    running: list[Message] = list(seeds)
+
     try:
-        messages = await agent.run(list(seeds))
-        for msg in messages[len(seeds):]:
+        # Streaming-mode dispatch: yield each SDK-shape message as
+        # ``run_iter`` produces it, not after the whole multi-turn loop
+        # returns. This matches the Claude Agent SDK contract — consumers
+        # see each AssistantMessage the instant its turn's stream
+        # finalizes (StreamingToolExecutor is already dispatching tool
+        # calls in parallel by that point), and the tool-result
+        # UserMessage lands as soon as the executor batch finishes,
+        # BEFORE the next assistant turn streams. The compat path
+        # already did this; the dict-options TS-SDK path was buffering
+        # via ``await agent.run(...)`` until this rewrite.
+        async for msg in agent.run_iter(running):
+            if id(msg) in seed_ids:
+                # Already echoed in step 2 — don't re-yield seeds.
+                continue
             if isinstance(msg, AssistantMessage):
                 num_turns += 1
                 last_stop_reason = msg.stop_reason or last_stop_reason
                 if msg.usage is not None:
                     agg_usage = _accumulate_usage(agg_usage, msg.usage)
-                    prev = model_usage.get(agent.model)
-                    new_mu = _to_model_usage(agent.model, agg_usage, backend_hint=backend_hint)
-                    model_usage[agent.model] = new_mu
+                    model_usage[agent.model] = _to_model_usage(
+                        agent.model, agg_usage, backend_hint=backend_hint
+                    )
                 api_msg = APIAssistantMessage(
                     id=_new_uuid(),
                     content=list(msg.content),
@@ -616,7 +635,15 @@ async def query(
                 if text:
                     final_text = text
             elif isinstance(msg, UserMessage):
-                # Tool-result-bearing user message produced by the loop.
+                # Two flavors flow through this branch:
+                #   1. The synthetic ``<system-reminder>``-wrapped meta
+                #      UserMessage that ``run_iter`` prepends to surface
+                #      user context (memory etc.). ``isMeta=True``.
+                #   2. A tool-result-bearing UserMessage appended by the
+                #      agent loop after a tool batch finishes.
+                # Both map to ``isSynthetic=True`` in the SDK shape so
+                # downstream renderers can tell them apart from
+                # user-typed messages.
                 yield _persist(SDKUserMessage(
                     message=APIUserMessage(content=msg.content),
                     uuid=_new_uuid(),
@@ -636,12 +663,17 @@ async def query(
                 ))
     except Exception as e:  # noqa: BLE001 — wrap into result.errors
         is_error = True
-        # Map our typed exceptions to upstream subtypes.
+        # Map our typed exceptions to upstream subtypes. BudgetExceededError
+        # carries one of {"turns", "input_tokens", "output_tokens",
+        # "total_tokens", "usd"} on ``.kind``. Anything turn-shaped maps to
+        # ``error_max_turns``; every $/token overrun maps to
+        # ``error_max_budget_usd`` since that's the only non-turn subtype
+        # Claude Agent SDK exposes.
         from .errors import BudgetExceededError
 
         if isinstance(e, BudgetExceededError):
             error_subtype = (
-                "error_max_turns" if e.kind == "max_turns" else "error_max_budget_usd"
+                "error_max_turns" if e.kind == "turns" else "error_max_budget_usd"
             )
         else:
             error_subtype = "error_during_execution"

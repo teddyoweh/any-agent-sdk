@@ -169,8 +169,12 @@ async def query(
                 )
     except BudgetExceededError as e:
         is_error = True
+        # ``BudgetExceededError.kind`` is one of {"turns", "input_tokens",
+        # "output_tokens", "total_tokens", "usd"} — see budget.py. The
+        # Claude SDK only exposes two subtypes here, so anything that
+        # isn't ``"turns"`` collapses to ``error_max_budget_usd``.
         error_subtype = (
-            "error_max_turns" if e.kind == "max_turns" else "error_max_budget_usd"
+            "error_max_turns" if e.kind == "turns" else "error_max_budget_usd"
         )
         error_strings.append(f"{type(e).__name__}: {e}")
     except Exception as e:  # noqa: BLE001
