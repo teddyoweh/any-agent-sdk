@@ -97,6 +97,26 @@ def _build_parser() -> argparse.ArgumentParser:
         default="http://localhost:11434",
         help="Override the Ollama base URL.",
     )
+    p_setup.add_argument(
+        "--no-auto-start-server",
+        action="store_false",
+        dest="auto_start_server",
+        default=True,
+        help=(
+            "Don't spawn `ollama serve` if the daemon isn't running. "
+            "Default: setup-local starts it for you — the whole point is "
+            "zero-to-model in one command."
+        ),
+    )
+    p_setup.add_argument(
+        "--start-timeout",
+        type=float,
+        default=15.0,
+        dest="start_timeout_s",
+        help=(
+            "Seconds to wait for `ollama serve` to start answering. Default 15."
+        ),
+    )
 
     p_setup_llamacpp = sub.add_parser(
         "setup-local-llamacpp",
@@ -588,6 +608,8 @@ def _cmd_setup_local(args: argparse.Namespace) -> int:
         install_ollama_if_missing=args.install_ollama,
         skip_smoke_test=args.skip_smoke_test,
         base_url=args.base_url,
+        auto_start_server=getattr(args, "auto_start_server", True),
+        start_timeout_s=getattr(args, "start_timeout_s", 15.0),
     )
 
 
