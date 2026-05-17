@@ -270,6 +270,65 @@ def _build_agent(opts: dict[str, Any]) -> Agent:
                 for inner in t:
                     registry.add(inner)
 
+    # Bridge in-process MCP servers (`mcp_servers={"calc": create_sdk_mcp_server(...)}`)
+    # into the agent's tool registry under the Claude-SDK-style namespaced
+    # names `mcp__{server}__{tool}`. Without this, tools registered on an
+    # MCP server never reach the wire-format tools list the provider sends
+    # to the model — the model has no idea those tools exist, so it just
+    # answers in prose (or, worse, types "Call the multiply tool:" as text).
+    #
+    # Note on shape: ClaudeAgentOptions.to_query_options() normalizes
+    # `mcp_servers` via `dict.items()`, so what we see here is a list of
+    # `(name, config)` tuples — not bare configs. We accept either form.
+    mcp_servers_opt = opts.get("mcp_servers") or []
+    if isinstance(mcp_servers_opt, dict):
+        mcp_servers_opt = list(mcp_servers_opt.items())
+    for entry in mcp_servers_opt:
+        if isinstance(entry, tuple) and len(entry) == 2:
+            server_name, cfg = entry
+        else:
+            cfg = entry
+            server_name = getattr(cfg, "name", None)
+        # Only in-process `SdkServerConfig` exposes a directly-walkable
+        # tool list. External transports (stdio/sse/http) get their tools
+        # via the MCP `list_tools` round-trip, which the agent loop
+        # handles separately.
+        server = getattr(cfg, "server", None)
+        if server is None:
+            continue
+        inner_registry = getattr(server, "registry", None)
+        if not server_name:
+            server_name = getattr(server, "name", None)
+        if inner_registry is None or not server_name:
+            continue
+        for inner in inner_registry:
+            namespaced = f"mcp__{server_name}__{inner.name}"
+            registry.add(
+                Tool(
+                    name=namespaced,
+                    description=inner.description,
+                    input_schema=inner.input_schema,
+                    fn=inner.fn,
+                    is_concurrency_safe=inner.is_concurrency_safe,
+                    abort_siblings_on_error=inner.abort_siblings_on_error,
+                    is_read_only=inner.is_read_only,
+                    timeout_s=inner.timeout_s,
+                )
+            )
+
+    # `allowed_tools` filters what the model can see. The compat layer
+    # stashes it under `opts["extra"]["allowed_tools"]`, not top-level —
+    # check both. If set, drop anything not on the list (Claude-SDK parity).
+    extra_opt = opts.get("extra") or {}
+    allowed = opts.get("allowed_tools") or extra_opt.get("allowed_tools")
+    if allowed:
+        allowed_set = set(allowed)
+        filtered = ToolRegistry()
+        for t in registry:
+            if t.name in allowed_set:
+                filtered.add(t)
+        registry = filtered
+
     kw: dict[str, Any] = {
         "model": model,
         "backend": backend,
@@ -284,6 +343,10 @@ def _build_agent(opts: dict[str, Any]) -> Agent:
         if key in opts:
             kw[key] = opts[key]
 
+    # ``allowed_tools`` is intentionally NOT in ``consumed`` — it flows
+    # through to ``extra`` so ``_system_tools_list`` can read it for the
+    # init SystemMessage (Claude-SDK parity: the init message advertises
+    # only the allowed names). We've already filtered the registry above.
     consumed = set(kw.keys()) | {
         "model", "backend", "tools", "system", "max_tokens", "temperature",
         "max_turns", "max_steps", "max_usd", "api_key",

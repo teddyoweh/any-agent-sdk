@@ -467,7 +467,13 @@ async def _cmd_run_async(args: argparse.Namespace) -> int:
     options = _build_options(args)
     async for msg in query(prompt=args.prompt, options=options):
         if isinstance(msg, SDKAssistantMessage):
-            for block in msg.content_blocks:
+            # SDKAssistantMessage wraps APIAssistantMessage under `.message`,
+            # which carries the list of content blocks (TextBlock, ToolUseBlock,
+            # ThinkingBlock, …). `content_blocks` doesn't exist on the struct —
+            # going through `.message.content` is the right path.
+            content = msg.message.content
+            blocks = content if isinstance(content, list) else []
+            for block in blocks:
                 text = getattr(block, "text", None)
                 if text:
                     print(text)
