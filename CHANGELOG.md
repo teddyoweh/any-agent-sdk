@@ -10,6 +10,40 @@ The full versioning policy is in [SEMVER.md](SEMVER.md).
 
 ### Added
 
+- **Built-in tracing — span tree of every agent run, no required dependency.**
+  New `Agent(tracer=...)` field accepts any object satisfying the new
+  `Tracer` protocol. The agent loop emits four span kinds:
+  - `agent.run` (one per `Agent.run()` / `run_iter()` call) carrying
+    `agent.model`, `agent.turns`, and aggregate token / cost totals.
+  - `agent.turn` (one per turn) with `turn.stop_reason`,
+    `turn.input_tokens`, `turn.output_tokens`, `turn.tool_uses`.
+  - `llm.call` (one per provider stream) with `llm.input_tokens`,
+    `llm.output_tokens`, `llm.cache_read_tokens`,
+    `llm.cache_creation_tokens`, `llm.stop_reason`, `llm.first_token_ms`.
+  - `tool.call` (one per dispatched tool) with `tool.name`, `tool.id`,
+    `tool.input.keys` (sorted KEYS only — never values, so PII can't
+    leak into observability backends), `tool.is_error`,
+    `tool.result.len`.
+
+  Ships two implementations:
+  - `InMemoryTracer` — zero-dep, records to a list; `tracer.tree()`
+    reconstructs the span forest, `tracer.summary()` aggregates by
+    span name, `tracer.write_jsonl(path)` exports to disk.
+  - `OTelTracer` — lazy-imports `opentelemetry.trace`. Plugs into any
+    existing OpenTelemetry pipeline (Datadog, Honeycomb, Tempo,
+    Jaeger, ...). Raises a clear `ImportError` at construction if
+    `opentelemetry-api` isn't installed.
+
+  Span ids are 16-char hex (OTel SpanID width); trace ids are 32-char
+  hex (OTel TraceID width) so exporters can use them verbatim. When
+  `Agent.tracer is None` the loop pays zero overhead — every span call
+  site is gated by a single `if tracer is None`. Tool-input keys are
+  recorded but **values are never copied into spans** — opinionated
+  privacy default that matches what production teams ship to SaaS
+  observability backends. Four new public exports: `Tracer`, `Span`,
+  `InMemoryTracer`, `OTelTracer`. Example:
+  `python -m any_agent_sdk.examples.with_tracing`.
+
 - **Structured output via `response_format`.** New `Agent(response_format=...)`
   and `ClaudeAgentOptions(response_format=...)` fields accept the OpenAI
   `response_format` shape — `{"type": "json_object"}` for free-form JSON, or

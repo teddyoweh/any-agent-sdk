@@ -185,6 +185,50 @@ Plus the OSS-specific bits the hosted SDKs don't need to think about:
 - **Universal tool use** — Path A (native via OpenAI-compat `tools[]`) when supported; Path B (prompt-engineered `<tool_call>` XML) when not; Path C (grammar-constrained JSON) when the server can enforce it. Capability-table-driven, automatic per model.
 - **Universal thinking** — handles inline `<think>` tags (R1, QwQ, Marco-o1, R1-Distill) and out-of-band thinking blocks. Zero cost when the model doesn't emit thinking.
 - **Backend agnosticism** — same agent code, one env var or one kwarg between Ollama at `localhost:11434` and Fireworks at `api.fireworks.ai`.
+- **Tracing built in** — `Agent(tracer=InMemoryTracer())` gives you a full span tree of every run (`agent.run` → `agent.turn` → `llm.call` + `tool.call`), with token / cost totals on the root span and `tool.call` spans that record input KEYS but never values. Swap in `OTelTracer()` to ship the same spans to Datadog / Honeycomb / Tempo / Jaeger with zero extra code. Anthropic's official SDK requires you to wire OpenTelemetry yourself; we ship it.
+
+---
+
+## Observability
+
+```python
+from any_agent_sdk import Agent, InMemoryTracer, UserMessage, TextBlock
+
+tracer = InMemoryTracer()
+agent = Agent(model="claude-sonnet-4.5", tools=[...], tracer=tracer)
+await agent.run([UserMessage(content=[TextBlock(text="...")])])
+
+# Flat list of every finished span, in end-time order.
+for sp in tracer.spans:
+    print(sp.name, sp.duration_ms, sp.attributes)
+
+# Or the forest, with parent/child links restored.
+import json; print(json.dumps(tracer.tree(), indent=2, default=str))
+
+# Or per-span-name aggregates + run totals (turns / tokens / cost_usd).
+print(tracer.summary())
+
+# Or ship the trace to disk for offline analysis.
+tracer.write_jsonl("trace.jsonl")
+```
+
+To push the same spans into an existing OpenTelemetry pipeline:
+
+```python
+from any_agent_sdk import OTelTracer
+tracer = OTelTracer(service_name="my-agent")          # requires opentelemetry-api
+agent  = Agent(model="claude-sonnet-4.5", tracer=tracer)
+```
+
+`OTelTracer` uses your already-configured `TracerProvider` — point it at Datadog, Honeycomb, Tempo, Jaeger, or anything else that speaks OTLP. We don't ship an exporter; we ship spans that fit your existing one. Spans carry the same attributes whether you use `InMemoryTracer` or `OTelTracer`, so dashboards built against one work against both.
+
+**Privacy by default.** Tool spans carry the sorted list of input *keys* but never input *values* — agent traces routinely get shipped to third-party SaaS and showed up in screenshots and tickets, so we made the safe choice the only choice. If you need values too, build your own `Tracer` impl in ~30 lines.
+
+Live example you can run with no API key:
+
+```bash
+python -m any_agent_sdk.examples.with_tracing
+```
 
 ---
 

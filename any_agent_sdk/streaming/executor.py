@@ -185,6 +185,8 @@ class StreamingToolExecutor:
         "_completion_send",
         "_completion_recv",
         "_completion_closed",
+        "_tracer",
+        "_trace_parent",
     )
 
     def __init__(
@@ -194,9 +196,17 @@ class StreamingToolExecutor:
         max_concurrency: int | None = None,
         can_use_tool: CanUseToolFn | None = None,
         cancellation_signal: "anyio.Event | None" = None,
+        tracer: "Any | None" = None,
+        trace_parent: "Any | None" = None,
     ) -> None:
         self._registry = registry
         self._can_use_tool = can_use_tool
+        # Tracing — set by the agent loop when ``Agent.tracer`` is on. When
+        # both are ``None`` the executor pays zero overhead. Each tool
+        # dispatch opens a ``tool.call`` span nested under ``trace_parent``
+        # (the per-turn span) — see ``_run_one`` for the wiring.
+        self._tracer = tracer
+        self._trace_parent = trace_parent
         self._max_concurrency = _resolve_max_concurrency(max_concurrency)
         # Parallel slots for concurrency-safe tools.
         self._sem = anyio.Semaphore(self._max_concurrency)
@@ -567,6 +577,26 @@ class StreamingToolExecutor:
         this is how ``abort_siblings_on_error`` kills subprocess-bearing
         bash tools the moment a peer fails."""
         scope = self._scopes[idx]
+        # Open a tool.call span (no-op when no tracer). Attributes capture
+        # the input KEYS only (never values) to avoid leaking secrets into
+        # observability backends.
+        tool_span = None
+        if self._tracer is not None:
+            try:
+                tool_span = self._tracer.start_span(
+                    "tool.call",
+                    parent=self._trace_parent,
+                    attributes={
+                        "tool.name": block.name,
+                        "tool.id": block.id,
+                        "tool.input.keys": sorted(
+                            list((block.input or {}).keys())
+                        ),
+                    },
+                )
+            except Exception:  # noqa: BLE001 — tracer must never crash the run
+                _LOG.debug("tracer.start_span failed", exc_info=True)
+                tool_span = None
         try:
             with scope:
                 await self._run_one_inner(idx, block)
@@ -578,6 +608,31 @@ class StreamingToolExecutor:
                 self._pending = 0
                 if not self._idle_event.is_set():
                     self._idle_event.set()
+            # Stamp result attributes + close the span.
+            if tool_span is not None and self._tracer is not None:
+                try:
+                    result = self._results[idx]
+                    if result is not None:
+                        tool_span.set_attributes({
+                            "tool.is_error": bool(result.is_error),
+                            "tool.result.len": (
+                                len(result.content)
+                                if isinstance(result.content, (str, list)) else 0
+                            ),
+                        })
+                    tool_span.end(
+                        status="error" if (
+                            result is not None and result.is_error
+                        ) else "ok"
+                    )
+                    mirror = getattr(
+                        self._tracer, "_mirror", None
+                    ) or self._tracer
+                    close_fn = getattr(mirror, "_close", None)
+                    if callable(close_fn):
+                        close_fn(tool_span)
+                except Exception:  # noqa: BLE001
+                    _LOG.debug("tracer span end failed", exc_info=True)
 
     async def _run_one_inner(self, idx: int, block: ToolUseBlock) -> None:
         tool = self._registry.get(block.name)
