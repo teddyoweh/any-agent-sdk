@@ -22,6 +22,7 @@ HookInput
 HookJSONOutput
 HookMatcher
 InMemorySessionStore
+InMemoryTracer
 InputJsonDelta
 IsolationMode
 Message
@@ -30,6 +31,7 @@ MessageStart
 MessageStop
 ModelCapability
 ModelUsage
+OTelTracer
 PermissionDeniedError
 PermissionResultAllow
 PermissionResultDeny
@@ -50,6 +52,7 @@ Session
 SessionInfo
 SessionNotFoundError
 SessionStore
+Span
 SqliteSessionStore
 StreamEvent
 StreamProtocolError
@@ -67,6 +70,7 @@ ToolRegistry
 ToolResultBlock
 ToolUseBlock
 ToolUsePath
+Tracer
 Usage
 UserMessage
 WebFetch

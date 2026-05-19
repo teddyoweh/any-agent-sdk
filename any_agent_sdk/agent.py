@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import AsyncIterator, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -67,6 +68,7 @@ from .permissions import (
 from .providers.base import Provider, detect_provider, resolve
 from .streaming.executor import StreamingToolExecutor
 from .tools import ToolRegistry
+from .tracing import Span, Tracer, maybe_span, maybe_start_span
 from .types import (
     AssistantMessage,
     ContentBlock,
@@ -140,6 +142,18 @@ class Agent:
     # __post_init__ so a bad value blows up at construction (where the user
     # can fix it) rather than at first turn.
     response_format: dict[str, Any] | None = None
+
+    # Tracing — see ``tracing.py``. ``None`` means "do nothing" — the agent
+    # loop pays zero overhead. Pass an ``InMemoryTracer()`` for local
+    # inspection / tests, or an ``OTelTracer()`` to ship spans to your
+    # OpenTelemetry pipeline (Datadog, Honeycomb, Tempo, Jaeger, ...). The
+    # tracer is shared with sub-agents so their spans nest under the parent
+    # ``agent.run`` span.
+    tracer: Tracer | None = None
+    # Parent span — set when this agent is being run as a sub-agent so its
+    # ``agent.run`` span nests under the parent's ``tool.call`` span. Users
+    # rarely set this directly; the sub-agent runner wires it.
+    _trace_parent: Span | None = None
 
     # Internal state populated in __post_init__ / run loop.
     _dispatcher: HookDispatcher | None = field(default=None, init=False)
@@ -431,6 +445,57 @@ class Agent:
 
         registry: ToolRegistry = self.tools  # type: ignore[assignment]
 
+        # Open the root ``agent.run`` span — covers the entire multi-turn
+        # loop. We deliberately open the span outside the for-loop so
+        # ``agent.turn`` children nest under it correctly. The span is
+        # closed in the ``finally`` below regardless of natural-stop /
+        # max-steps / exception path.
+        run_span = maybe_start_span(
+            self.tracer,
+            "agent.run",
+            parent=self._trace_parent,
+            attributes={
+                "agent.model": self.model,
+                "agent.backend": self.backend or "",
+                "agent.max_steps": self.max_steps,
+                "agent.tools.count": len(registry) if registry is not None else 0,
+                "agent.system.len": len(self.system) if self.system else 0,
+            },
+        )
+        # Track aggregate run-totals so we can stamp them on the run span
+        # at finalize-time. ``Usage`` fields default to 0 so a no-cost run
+        # still gets zeros (not None) on the span — easier dashboarding.
+        run_totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "cost_usd": 0.0,
+            "turns": 0,
+        }
+        run_error: BaseException | None = None
+
+        def _close_run_span(error: BaseException | None = None) -> None:
+            if run_span is None or self.tracer is None:
+                return
+            run_span.set_attributes({
+                "agent.turns": run_totals["turns"],
+                "agent.total_input_tokens": run_totals["input_tokens"],
+                "agent.total_output_tokens": run_totals["output_tokens"],
+                "agent.total_cache_read_tokens": run_totals["cache_read_tokens"],
+                "agent.total_cache_creation_tokens": run_totals["cache_creation_tokens"],
+                "agent.total_cost_usd": round(run_totals["cost_usd"], 8),
+            })
+            if error is not None:
+                run_span.end(status="error", exception=error)
+            else:
+                run_span.end()
+            # Move into the finished-spans list for in-memory inspection.
+            mirror = getattr(self.tracer, "_mirror", None) or self.tracer
+            close_fn = getattr(mirror, "_close", None)
+            if callable(close_fn):
+                close_fn(run_span)
+
         for _ in range(self.max_steps):
             # If the cancellation signal already fired BEFORE this turn
             # starts, bail without burning another model round-trip. The
@@ -442,7 +507,18 @@ class Agent:
                     "Stop",
                     HookContext(event="Stop", messages_snapshot=messages),
                 )
+                _close_run_span()
                 return
+            # Per-turn span — nests under agent.run when tracing is on.
+            turn_span = maybe_start_span(
+                self.tracer,
+                "agent.turn",
+                parent=run_span,
+                attributes={"turn.index": run_totals["turns"]},
+            )
+            llm_span: Span | None = None
+            llm_start_ns = time.monotonic_ns()
+            llm_first_token_ns: int | None = None
             # --------------------------------------------------------------
             # One turn, with mid-stream tool dispatch.
             #
@@ -471,9 +547,29 @@ class Agent:
             async with StreamingToolExecutor(
                 registry,
                 cancellation_signal=self.cancellation_signal,
+                tracer=self.tracer,
+                trace_parent=turn_span,
             ) as executor:
+                # llm.call span covers just the provider stream — start →
+                # MessageStop. ``first_token_ms`` is filled at the first
+                # ContentBlockDelta (TextDelta or ThinkingDelta) so users
+                # can dashboard TTFB independently of total latency.
+                llm_span = maybe_start_span(
+                    self.tracer,
+                    "llm.call",
+                    parent=turn_span,
+                    attributes={
+                        "llm.model": self.model,
+                        "llm.provider": getattr(self.provider, "name", "")
+                        or self._provider_hint or "",
+                    },
+                )
                 async for ev in self._provider_stream(messages):
                     assembler.feed(ev)
+                    if llm_first_token_ns is None and isinstance(
+                        ev, ContentBlockDelta
+                    ):
+                        llm_first_token_ns = time.monotonic_ns()
                     if isinstance(ev, ContentBlockStop):
                         await self._maybe_dispatch_closed_block(
                             ev,
@@ -489,6 +585,41 @@ class Agent:
                 assistant = assembler.finalize()
                 messages.append(assistant)
 
+                # Close the llm.call span now that the provider stream is
+                # done — *before* tool execution drains. ``llm.call`` is
+                # specifically "time the model spent generating," not
+                # "time the turn took including downstream tools." Tool
+                # latency lives on tool.call children.
+                if llm_span is not None and self.tracer is not None:
+                    llm_span.set_attributes({
+                        "llm.input_tokens": (
+                            assistant.usage.input_tokens
+                            if assistant.usage is not None else 0
+                        ),
+                        "llm.output_tokens": (
+                            assistant.usage.output_tokens
+                            if assistant.usage is not None else 0
+                        ),
+                        "llm.cache_read_tokens": (
+                            assistant.usage.cache_read_input_tokens or 0
+                            if assistant.usage is not None else 0
+                        ),
+                        "llm.cache_creation_tokens": (
+                            assistant.usage.cache_creation_input_tokens or 0
+                            if assistant.usage is not None else 0
+                        ),
+                        "llm.stop_reason": assistant.stop_reason or "",
+                        "llm.first_token_ms": (
+                            (llm_first_token_ns - llm_start_ns) / 1_000_000.0
+                            if llm_first_token_ns is not None else 0.0
+                        ),
+                    })
+                    llm_span.end()
+                    mirror = getattr(self.tracer, "_mirror", None) or self.tracer
+                    close_fn = getattr(mirror, "_close", None)
+                    if callable(close_fn):
+                        close_fn(llm_span)
+
                 # Bump turn + cost AFTER the assistant message materializes.
                 # Tools may already be running — that's fine, we still
                 # enforce budget on the turn that just finalized.
@@ -501,6 +632,33 @@ class Agent:
                             backend_hint=self._provider_hint,
                         )
                     self._budget_tracker.check()
+
+                # Update run-totals + turn-span attrs from this turn's usage.
+                if assistant.usage is not None:
+                    run_totals["input_tokens"] += assistant.usage.input_tokens or 0
+                    run_totals["output_tokens"] += assistant.usage.output_tokens or 0
+                    run_totals["cache_read_tokens"] += assistant.usage.cache_read_input_tokens or 0
+                    run_totals["cache_creation_tokens"] += assistant.usage.cache_creation_input_tokens or 0
+                    if self._budget_tracker is not None:
+                        run_totals["cost_usd"] = self._budget_tracker.total_usd
+                run_totals["turns"] += 1
+
+                if turn_span is not None:
+                    turn_span.set_attributes({
+                        "turn.stop_reason": assistant.stop_reason or "",
+                        "turn.input_tokens": (
+                            assistant.usage.input_tokens
+                            if assistant.usage is not None else 0
+                        ),
+                        "turn.output_tokens": (
+                            assistant.usage.output_tokens
+                            if assistant.usage is not None else 0
+                        ),
+                        "turn.tool_uses": sum(
+                            1 for b in assistant.content
+                            if isinstance(b, ToolUseBlock)
+                        ),
+                    })
 
                 # Yield the assistant turn the moment it's complete — BEFORE
                 # blocking on tool execution. Consumers see the tool_use
@@ -520,6 +678,13 @@ class Agent:
                         "Stop",
                         HookContext(event="Stop", messages_snapshot=messages),
                     )
+                    if turn_span is not None and self.tracer is not None:
+                        turn_span.end()
+                        mirror = getattr(self.tracer, "_mirror", None) or self.tracer
+                        close_fn = getattr(mirror, "_close", None)
+                        if callable(close_fn):
+                            close_fn(turn_span)
+                    _close_run_span()
                     return
 
                 # Drain every dispatched tool. ``wait_all`` returns results
@@ -563,7 +728,18 @@ class Agent:
             messages.append(tool_result_msg)
             yield tool_result_msg
 
+            # End the turn span now that this turn (model call + tools +
+            # post-tool hooks) is fully wrapped up. Tool spans live as
+            # children of this turn via the executor's trace_parent.
+            if turn_span is not None and self.tracer is not None:
+                turn_span.end()
+                mirror = getattr(self.tracer, "_mirror", None) or self.tracer
+                close_fn = getattr(mirror, "_close", None)
+                if callable(close_fn):
+                    close_fn(turn_span)
+
         _log.warning("agent hit max_steps=%d without natural stop", self.max_steps)
+        _close_run_span()
 
     async def _maybe_dispatch_closed_block(
         self,

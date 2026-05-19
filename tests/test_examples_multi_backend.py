@@ -278,8 +278,14 @@ async def _run_query_with_tool(
     user_tool: Tool | None = None,
     prompt: str = "do it",
     final_text: str = "ok",
+    extra_options: dict | None = None,
 ) -> list[Any]:
-    """Run ``query()`` with a custom tool the model is scripted to call."""
+    """Run ``query()`` with a custom tool the model is scripted to call.
+
+    ``extra_options`` is shallow-merged into the options dict passed to
+    ``query()`` — used by verifiers that want to thread an extra field
+    (e.g. ``{"tracer": InMemoryTracer()}``) without forking the helper.
+    """
 
     if user_tool is None:
         @tool
@@ -296,16 +302,19 @@ async def _run_query_with_tool(
     )
     mock = _ScriptedMock([turn1, turn2])
     seen: list[Any] = []
+    options: dict[str, Any] = {
+        "model": model,
+        "backend": url,
+        "tools": [user_tool],
+        "max_tokens": 256,
+        "max_turns": 3,
+    }
+    if extra_options:
+        options.update(extra_options)
     with _install_backend(backend_kind, mock):
         async for msg in query(
             prompt=prompt,
-            options={
-                "model": model,
-                "backend": url,
-                "tools": [user_tool],
-                "max_tokens": 256,
-                "max_turns": 3,
-            },
+            options=options,
         ):
             seen.append(msg)
     return seen
@@ -741,6 +750,34 @@ async def _verify_streaming_render(backend_kind: str, model: str, url: str) -> N
     assert "hello" in joined, f"streaming text was {joined!r}"
 
 
+async def _verify_with_tracing(backend_kind: str, model: str, url: str) -> None:
+    """with_tracing.py — query() with an InMemoryTracer captures one
+    ``agent.run`` span (plus its turn / llm / tool descendants). We
+    verify the tracer is wired across every backend in the matrix and
+    the span tree finalises with a non-None duration on each span."""
+
+    from any_agent_sdk import InMemoryTracer
+
+    tracer = InMemoryTracer()
+
+    @tool
+    async def lookup(city: str) -> str:
+        return f"{city}: 70F"
+
+    seen = await _run_query_with_tool(
+        backend_kind,
+        model,
+        url,
+        user_tool=lookup,
+        prompt="Weather in SF?",
+        extra_options={"tracer": tracer},
+    )
+    _assert_completed_with_result(seen)
+    assert tracer.spans, "expected at least one span"
+    assert any(s.name == "agent.run" for s in tracer.spans)
+    assert all(s.duration_ms is not None for s in tracer.spans)
+
+
 async def _verify_with_thinking(backend_kind: str, model: str, url: str) -> None:
     """with_thinking.py — exercises ``Agent.stream`` against a model that
     emits ThinkingBlock deltas. We don't need a real reasoning model —
@@ -889,11 +926,12 @@ EXAMPLES: dict[str, Any] = {
     "streaming_mode_ipython.py": _verify_streaming_mode_ipython,
     "streaming_render.py": _verify_streaming_render,
     "with_thinking.py": _verify_with_thinking,
+    "with_tracing.py": _verify_with_tracing,
 }
 
 
 def test_example_count_matches_roadmap() -> None:
-    """The README Roadmap promises 16 examples — keep us honest.
+    """The README Roadmap promises 17 examples — keep us honest.
 
     If you add or remove an example file, this test forces you to
     update the matrix above (or the README) instead of silently
@@ -911,7 +949,7 @@ def test_example_count_matches_roadmap() -> None:
     assert on_disk == matrix, (
         f"matrix/disk mismatch.\non-disk: {on_disk}\nmatrix:  {matrix}"
     )
-    assert len(matrix) == 16, f"expected 16 examples, found {len(matrix)}"
+    assert len(matrix) == 17, f"expected 17 examples, found {len(matrix)}"
 
 
 # ---------------------------------------------------------------------------

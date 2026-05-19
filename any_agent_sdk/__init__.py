@@ -138,6 +138,12 @@ from .response_format import (
     translate_response_format,
 )
 from .tools import Tool, ToolRegistry, tool
+from .tracing import (
+    InMemoryTracer,
+    OTelTracer,
+    Span,
+    Tracer,
+)
 from .types import (
     AssistantMessage,
     ContentBlock,
@@ -246,6 +252,11 @@ __all__ = [
     "ResponseFormatError",
     "normalize_response_format",
     "translate_response_format",
+    # Tracing
+    "Tracer",
+    "Span",
+    "InMemoryTracer",
+    "OTelTracer",
     # Errors
     "AgentError",
     "AuthError",
